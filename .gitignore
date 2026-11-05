@@ -1,0 +1,15 @@
+# Dependensi & artefak build
+node_modules/
+dist/
+
+# Data lokal SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Perencanaan lokal (tidak masuk git)
+_bmad/
+_bmad-output/
+
+# Lingkungan
+.env
