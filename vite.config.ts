@@ -6,7 +6,9 @@ export default defineConfig({
   plugins: [
     react(),
     devServer({
-      entry: "./src/server/app.ts",
+      // dev.ts membuka + memigrasi DB dev lalu men-export app — sehingga
+      // /api/* hidup di `npm run dev`; produksi tetap lewat src/server/index.ts.
+      entry: "./src/server/dev.ts",
       export: "default",
       // Default excludes keep module requests (/src/**, .ts/.tsx/.js, /@vite/*)
       // in the hands of the vite dev pipeline. `/` is added so the dev shell
