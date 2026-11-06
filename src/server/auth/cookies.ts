@@ -1,12 +1,13 @@
 import { deleteCookie, setCookie } from "hono/cookie";
 import type { Context } from "hono";
+import { SESSION_TTL_MS } from "./service.ts";
 
 // Satu-satunya tempat nama cookie sesi dan atributnya didefinisikan (AD-9).
 
 export const SESSION_COOKIE = "yui_session";
 
-/** 30 hari dalam detik — sinkron dengan SESSION_TTL_MS service. */
-const SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
+/** Umur cookie sesi — DITURUNKAN dari SESSION_TTL_MS service (satu sumber kebenaran). */
+const SESSION_MAX_AGE_SECONDS = SESSION_TTL_MS / 1000;
 
 const COOKIE_ATTRIBUTES = {
   httpOnly: true,

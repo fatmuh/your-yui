@@ -24,7 +24,3 @@ export function createApp(staticRoot = "dist", db?: YuiDatabase) {
 
   return app;
 }
-
-const app = createApp();
-
-export default app;
