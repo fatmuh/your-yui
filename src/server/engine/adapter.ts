@@ -84,6 +84,12 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
     const key = pairKey(input.userId, input.threadId);
     const existing = sessionsByKey.get(key);
     if (existing) {
+      // Idempoten per (userId, threadId), tapi binding config di-refresh bila
+      // pemanggil kini memegang config (session lama bisa lahir saat pengguna
+      // belum punya config — null jangan menempel selamanya).
+      if (input.providerConfigId !== null) {
+        existing.providerConfigId = input.providerConfigId;
+      }
       return { sessionId: existing.sessionId };
     }
     const record: SessionRecord = {

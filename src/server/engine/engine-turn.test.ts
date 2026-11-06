@@ -365,6 +365,31 @@ describe("POST /api/engine/turn — matriks story", () => {
     expect(finalB?.data.text).toBe("Balasan untuk bravo.");
   }, 30_000);
 
+  it("config datang belakangan: threadId sama pulih setelah config disimpan (binding di-refresh)", async () => {
+    const { app, db } = makeApp();
+    const mock = await startMockOpenAI({ replyText: "Kini config sudah ada." });
+    openMocks.push(mock);
+    const user = await registerUser(app, "config-belakangan");
+
+    // Giliran pertama: belum ada config → no_provider_config, threadId tetap.
+    const threadId = "thread-belakangan";
+    const before = await readSse(await postTurn(app, user.token, { threadId, content: "Sebelum" }));
+    expect(names(before.events)).toEqual(["error", "turn.settled"]);
+    expect(before.events[0].data.code).toBe("no_provider_config");
+
+    // Config disimpan, giliran ulang di thread YANG SAMA → binding session
+    // di-refresh, bukan terjebak null selamanya.
+    seedConfig(db, user.userId, mock, "sk-live-belakangan-4444ghij");
+    const after = await readSse(await postTurn(app, user.token, { threadId, content: "Sesudah" }));
+    expect(names(after.events)).toEqual(
+      expect.arrayContaining(["message.delta", "message.final", "turn.settled"]),
+    );
+    const finalEvent = after.events.find((frame) => frame.event === "message.final");
+    expect(finalEvent?.data.text).toBe("Kini config sudah ada.");
+    expect(mock.requests).toHaveLength(1);
+    expect(after.raw).not.toContain("sk-live-belakangan");
+  }, 30_000);
+
   it("threadId sama dipakai ulang: sesi idempoten (adapter), settled tetap terurut", async () => {
     const { app, db } = makeApp();
     const mock = await startMockOpenAI({ replyText: "Giliran kedua di thread sama." });
