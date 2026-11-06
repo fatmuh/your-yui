@@ -89,20 +89,23 @@ describe("migrasi schema dasar", () => {
 });
 
 describe("data users dan auth_sessions", () => {
-  function seedUser(db: ReturnType<typeof createDatabase>, username = "yui-user"): string {
+  function seedUser(
+    db: ReturnType<typeof createDatabase>,
+    username = "yui-user",
+  ): { id: string; now: number } {
     const now = Date.now();
     const id = ulid();
     db.insert(users)
       .values({ id, username, passwordHash: "argon2-placeholder", createdAt: now, updatedAt: now })
       .run();
-    return id;
+    return { id, now };
   }
 
   it("roundtrip ULID: user + sesi terhubung terbaca utuh via drizzle typed API", () => {
     const db = makeDb();
     migrateDatabase(db);
 
-    const userId = seedUser(db);
+    const { id: userId, now: insertedAt } = seedUser(db);
     const sessionId = ulid();
     const createdAt = Date.now();
     const tokenHash = hashToken("raw-cookie-token");
@@ -124,10 +127,9 @@ describe("data users dan auth_sessions", () => {
       id: userId,
       username: "yui-user",
       passwordHash: "argon2-placeholder",
-      createdAt: userRow.createdAt,
-      updatedAt: userRow.updatedAt,
+      createdAt: insertedAt,
+      updatedAt: insertedAt,
     });
-    expect(userRow.createdAt).toBeTypeOf("number");
     expect(sessionRow).toEqual({
       id: sessionId,
       userId,
@@ -146,7 +148,7 @@ describe("data users dan auth_sessions", () => {
 
     expect(db.$client.pragma("foreign_keys", { simple: true })).toBe(1);
 
-    const userId = seedUser(db);
+    const { id: userId } = seedUser(db);
     const createdAt = Date.now();
     db.insert(authSessions)
       .values({
@@ -177,7 +179,7 @@ describe("data users dan auth_sessions", () => {
     const db = makeDb();
     migrateDatabase(db);
 
-    const userId = seedUser(db);
+    const { id: userId } = seedUser(db);
     const tokenHash = hashToken("same-token");
     const createdAt = Date.now();
 
