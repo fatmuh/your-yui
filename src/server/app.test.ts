@@ -12,7 +12,7 @@ describe("GET /healthz", () => {
 
 describe("GET / (static shell)", () => {
   it("serves index.html when the static root has a build", async () => {
-    const res = await createApp("src/server/__fixtures__/dist").request("/");
+    const res = await createApp("src/server/__fixtures__/shell").request("/");
 
     expect(res.status).toBe(200);
     await expect(res.text()).resolves.toContain("<div id=\"root\"></div>");
