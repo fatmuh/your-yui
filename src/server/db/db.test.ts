@@ -55,8 +55,14 @@ describe("migrasi schema dasar", () => {
 
     migrateDatabase(db);
 
-    // Hanya tabel fondasi + internal drizzle — tanpa tabel epik lain.
-    expect(tableNames(file)).toEqual(["__drizzle_migrations", "auth_sessions", "users"]);
+    // Tabel fondasi (users, auth_sessions) + tabel epik penyedia
+    // (provider_configs, story tracer epic-penyedia) + internal drizzle.
+    expect(tableNames(file)).toEqual([
+      "__drizzle_migrations",
+      "auth_sessions",
+      "provider_configs",
+      "users",
+    ]);
 
     const raw = new Database(file);
     try {
@@ -78,10 +84,11 @@ describe("migrasi schema dasar", () => {
 
     const raw = new Database(file);
     try {
+      // Dua migrasi ter-commit: fondasi (0000) + penyedia (0001).
       const applied = raw
         .prepare("SELECT count(*) AS n FROM __drizzle_migrations")
         .get() as { n: number };
-      expect(applied.n).toBe(1);
+      expect(applied.n).toBe(2);
     } finally {
       raw.close();
     }
