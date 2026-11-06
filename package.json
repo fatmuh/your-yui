@@ -9,21 +9,27 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "db:generate": "drizzle-kit generate",
     "test": "vitest run",
     "typecheck": "tsc -b"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.0",
+    "better-sqlite3": "13.0.3",
+    "drizzle-orm": "~0.45.0",
     "hono": "~4.13.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "ulidx": "^2.4.1"
   },
   "devDependencies": {
     "@hono/vite-dev-server": "^0.26.1",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.2.0",
+    "drizzle-kit": "^0.31.0",
     "typescript": "~5.7.2",
     "vite": "^6.1.0",
     "vitest": "^5.1.0"
