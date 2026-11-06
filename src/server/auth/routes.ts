@@ -3,6 +3,7 @@ import { getCookie } from "hono/cookie";
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { YuiDatabase } from "../db/index.ts";
+import type { UserDto } from "../../shared/app.ts";
 import {
   AuthError,
   deleteSession,
@@ -106,12 +107,13 @@ export function authRoutes(db: YuiDatabase): Hono {
     if (user === null) {
       return errorResponse(c, 401, "unauthorized");
     }
-    // DB epoch-ms → ISO-8601 UTC di API (konvensi spine).
-    return c.json({
+    // DB epoch-ms → ISO-8601 UTC di API (konvensi spine) — diperiksa terhadap kontrak shared.
+    const me: UserDto = {
       id: user.id,
       username: user.username,
       createdAt: new Date(user.createdAt).toISOString(),
-    });
+    };
+    return c.json(me);
   });
 
   return app;

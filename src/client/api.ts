@@ -5,12 +5,10 @@
 // respons gagal dilempar sebagai ApiError bermuatan code+message, bukan respons
 // mentah, sehingga AuthPage menampilkan pesan bersih tanpa dump JSON.
 
-/** User sesi: body register/login `{id, username}`; /api/me menambah createdAt ISO. */
-export type CurrentUser = {
-  id: string;
-  username: string;
-  createdAt?: string;
-};
+import type { UserDto } from "../shared/app.ts";
+
+/** User sesi di wire API — turunan kontrak shared (AD-8), bukan definisi lepas. */
+export type CurrentUser = UserDto;
 
 /**
  * Error API — dibedakan dari Error biasa agar UI bisa menampilkan `message`

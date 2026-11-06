@@ -4,6 +4,7 @@ import { and, eq, gt } from "drizzle-orm";
 import { ulid } from "ulidx";
 import { authSessions, users } from "../db/schema.ts";
 import type { YuiDatabase } from "../db/index.ts";
+import type { UserDto } from "../../shared/app.ts";
 
 // Service auth (AD-9): hash/verify argon2 + siklus hidup sesi token — tanpa HTTP.
 // Pola post-Lucia: token mentah hanya keluar sekali ke cookie; DB menyimpan
@@ -40,8 +41,8 @@ export class AuthError extends Error {
   }
 }
 
-/** Bagian user yang boleh keluar API — `passwordHash` tidak pernah ikut. */
-export type PublicUser = { id: string; username: string };
+/** Bagian user yang boleh keluar API — `passwordHash` tidak pernah ikut. Turunan kontrak shared (AD-8). */
+export type PublicUser = Pick<UserDto, "id" | "username">;
 
 export type SessionUser = PublicUser & { createdAt: number };
 

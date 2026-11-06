@@ -16,3 +16,13 @@ export const APP_ID = "yui";
 export type HealthDto = {
   app: string;
 };
+
+/**
+ * User DTO on the API wire (AD-8 contract): register/login return `{id, username}`;
+ * GET /api/me adds `createdAt` as ISO-8601 UTC (DB stores epoch-ms; converted at the edge).
+ */
+export type UserDto = {
+  id: string;
+  username: string;
+  createdAt?: string;
+};
