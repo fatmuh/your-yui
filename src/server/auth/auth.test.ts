@@ -288,12 +288,12 @@ describe("POST /api/auth/logout + pencabutan & isolasi", () => {
 
   it("isolasi dua akun: me(A)=A, me(B)=B; logout A tidak mempengaruhi sesi B", async () => {
     const { app } = makeApp();
-    const cookieA = sessionToken(
-      await register(app, "alpha", "password-tepat"),
-    );
-    const cookieB = sessionToken(
-      await register(app, "bravo", "password-lain"),
-    );
+    // Alur matriks "register+login A dan B": akun dibuat lewat register, tapi
+    // cookie yang diuji adalah hasil LOGIN — jalur returning user story 4.
+    await register(app, "alpha", "password-tepat");
+    await register(app, "bravo", "password-lain");
+    const cookieA = sessionToken(await login(app, "alpha", "password-tepat"));
+    const cookieB = sessionToken(await login(app, "bravo", "password-lain"));
     expect(cookieA).not.toBe(cookieB);
 
     const meA = await me(app, cookieA);
@@ -302,7 +302,7 @@ describe("POST /api/auth/logout + pencabutan & isolasi", () => {
     const meB = await me(app, cookieB);
     await expect(meB.json()).resolves.toMatchObject({ username: "bravo" });
 
-    // Pencabutan ter-scope per sesi: hanya cookie A yang mati.
+    // Pencabutan ter-scope per sesi: hanya sesi login A yang mati.
     await app.request("/api/auth/logout", {
       method: "POST",
       headers: { cookie: `${SESSION_COOKIE}=${cookieA}` },
