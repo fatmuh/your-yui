@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Hono } from "hono";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
+import { threads } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { upsertProviderConfig } from "../providers/store.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../../tests/helpers/mock-openai.ts";
@@ -57,6 +58,14 @@ function names(events: SseEvent[]): string[] {
   return events.map((frame) => frame.event);
 }
 
+/** Fixture thread milik sesi (story 3: threadId string kini wajib thread
+ * milik pengguna — bukan id ephemeral arbiter). Test boleh menulis langsung
+ * lewat drizzle; penulis tunggal AD-5 berlaku untuk client, bukan untuk test. */
+function seedThread(db: YuiDatabase, userId: string, threadId: string): void {
+  const now = Date.now();
+  db.insert(threads).values({ id: threadId, userId, createdAt: now, updatedAt: now }).run();
+}
+
 afterEach(() => {
   while (openDbs.length > 0) {
     openDbs.pop()?.$client.close();
@@ -84,6 +93,7 @@ describe("POST /api/engine/turn — matriks story", () => {
     const user = await registerUser(app, "arjuna");
     const apiKey = "sk-live-uji-1234567890abcd";
     seedConfig(db, user.userId, mock, apiKey);
+    seedThread(db, user.userId, "thread-uji-1");
 
     const res = await postTurn(app, user.token, {
       threadId: "thread-uji-1",
@@ -148,10 +158,13 @@ describe("POST /api/engine/turn — matriks story", () => {
     expect(res.status).toBe(200);
 
     const { events, raw } = await readSse(res);
-    expect(names(events)).toEqual(["error", "turn.settled"]);
-    expect(events[0].data.code).toBe("no_provider_config");
-    expect(typeof events[0].data.message).toBe("string");
-    expect(events[1].data).toEqual({ threadId: events[0].data.threadId });
+    // Story 3: giliran tetap jadi penulis — thread auto + thread.updated
+    // (bawa judul turunan) mengalir SEBELUM error; settled tetap terakhir.
+    expect(names(events)).toEqual(["thread.updated", "error", "turn.settled"]);
+    expect(events[0].data.title).toBe("Halo");
+    expect(events[1].data.code).toBe("no_provider_config");
+    expect(typeof events[1].data.message).toBe("string");
+    expect(events[2].data).toEqual({ threadId: events[1].data.threadId });
     expect(raw).not.toMatch(/sk-/);
   }, 30_000);
 
@@ -197,15 +210,18 @@ describe("POST /api/engine/turn — matriks story", () => {
     const user = await registerUser(app, "provider-gagal");
     const apiKey = "sk-live-gagal-9999efgh";
     seedConfig(db, user.userId, failing, apiKey);
+    seedThread(db, user.userId, "thread-gagal");
 
     const failed = await postTurn(app, user.token, { threadId: "thread-gagal", content: "Coba" });
     expect(failed.status).toBe(200);
     const { events, raw } = await readSse(failed);
 
-    expect(names(events)).toEqual(["error", "turn.settled"]);
-    expect(events[0].data.code).toBe("provider_error");
-    expect(typeof events[0].data.message).toBe("string");
-    expect(events[0].data.threadId).toBe("thread-gagal");
+    // Thread milik sesi → thread.updated tanpa judul dulu, lalu error+settled.
+    expect(names(events)).toEqual(["thread.updated", "error", "turn.settled"]);
+    expect(events[0].data).not.toHaveProperty("title");
+    expect(events[1].data.code).toBe("provider_error");
+    expect(typeof events[1].data.message).toBe("string");
+    expect(events[1].data.threadId).toBe("thread-gagal");
     // Log/respons hanya bentuk aman: kredensial tak pernah tampil utuh.
     expect(raw).not.toContain(apiKey);
 
@@ -256,9 +272,9 @@ describe("POST /api/engine/turn — matriks story", () => {
       const res = await postTurn(app, user.token, { content: "Halo" });
       expect(res.status).toBe(200);
       const { events } = await readSse(res);
-      expect(names(events)).toEqual(["error", "turn.settled"]);
-      expect(events[0].data.code).toBe("engine_setup_failed");
-      expect(events[0].data.message).toContain("APP_ENCRYPTION_KEY");
+      expect(names(events)).toEqual(["thread.updated", "error", "turn.settled"]);
+      expect(events[1].data.code).toBe("engine_setup_failed");
+      expect(events[1].data.message).toContain("APP_ENCRYPTION_KEY");
       // Tiruan tak pernah tersentuh — engine tidak terpasang tanpa KEK.
       expect(mock.requests).toHaveLength(0);
     } finally {
@@ -280,8 +296,9 @@ describe("POST /api/engine/turn — matriks story", () => {
     seedConfig(db, userA.userId, mockA, "sk-live-alpha-aaa1111aaaa");
     seedConfig(db, userB.userId, mockB, "sk-live-bravo-bbb2222bbbb");
 
-    const turnA = await postTurn(app, userA.token, { threadId: "ta", content: "Untuk alpha" });
-    const turnB = await postTurn(app, userB.token, { threadId: "tb", content: "Untuk bravo" });
+    // Tanpa threadId → thread auto per pengguna (semantik story 3).
+    const turnA = await postTurn(app, userA.token, { content: "Untuk alpha" });
+    const turnB = await postTurn(app, userB.token, { content: "Untuk bravo" });
     const eventsA = await readSse(turnA);
     const eventsB = await readSse(turnB);
 
@@ -305,9 +322,10 @@ describe("POST /api/engine/turn — matriks story", () => {
 
     // Giliran pertama: belum ada config → no_provider_config, threadId tetap.
     const threadId = "thread-belakangan";
+    seedThread(db, user.userId, threadId);
     const before = await readSse(await postTurn(app, user.token, { threadId, content: "Sebelum" }));
-    expect(names(before.events)).toEqual(["error", "turn.settled"]);
-    expect(before.events[0].data.code).toBe("no_provider_config");
+    expect(names(before.events)).toEqual(["thread.updated", "error", "turn.settled"]);
+    expect(before.events[1].data.code).toBe("no_provider_config");
 
     // Config disimpan, giliran ulang di thread YANG SAMA → binding session
     // di-refresh, bukan terjebak null selamanya.
@@ -328,6 +346,7 @@ describe("POST /api/engine/turn — matriks story", () => {
     openMocks.push(mock);
     const user = await registerUser(app, "thread-sama");
     seedConfig(db, user.userId, mock, "sk-live-thread-3333cdef");
+    seedThread(db, user.userId, "t-sama");
 
     const first = await readSse(await postTurn(app, user.token, { threadId: "t-sama", content: "Satu" }));
     const second = await readSse(await postTurn(app, user.token, { threadId: "t-sama", content: "Dua" }));

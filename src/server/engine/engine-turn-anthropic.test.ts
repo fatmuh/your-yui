@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Hono } from "hono";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
+import { threads } from "../db/schema.ts";
 import { upsertProviderConfig } from "../providers/store.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../../tests/helpers/mock-openai.ts";
 import { startMockAnthropic, type MockAnthropic } from "../../../tests/helpers/mock-anthropic.ts";
@@ -75,6 +76,14 @@ function names(events: SseEvent[]): string[] {
   return events.map((frame) => frame.event);
 }
 
+/** Fixture thread milik sesi (story 3: threadId string wajib thread milik
+ * pengguna). Test menulis langsung lewat drizzle — penulis tunggal AD-5
+ * berlaku untuk client, bukan untuk test. */
+function seedThread(db: YuiDatabase, userId: string, threadId: string): void {
+  const now = Date.now();
+  db.insert(threads).values({ id: threadId, userId, createdAt: now, updatedAt: now }).run();
+}
+
 afterEach(() => {
   while (openDbs.length > 0) {
     openDbs.pop()?.$client.close();
@@ -102,6 +111,7 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
     const user = await registerUser(app, "anthropic-happy");
     const apiKey = "sk-ant-api-uji-1234567890abcd";
     seedAnthropicConfig(db, user.userId, mock, apiKey);
+    seedThread(db, user.userId, "thread-anthropic-1");
 
     const res = await postTurn(app, user.token, {
       kind: "anthropic",
@@ -175,6 +185,7 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
     // SATU thread untuk kedua giliran: binding sesi latest-wins per
     // (userId, threadId) — giliran kedua memakai config kind keduanya.
     const threadId = "thread-dua-jenis";
+    seedThread(db, user.userId, threadId);
     const turnOpenai = await postTurn(app, user.token, {
       kind: "openai-compatible",
       threadId,
@@ -217,15 +228,17 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
     const user = await registerUser(app, "anthropic-gagal");
     const apiKey = "sk-ant-api-gagal-9999efgh";
     seedAnthropicConfig(db, user.userId, failing, apiKey);
+    seedThread(db, user.userId, "thread-ag");
 
     const failed = await postTurn(app, user.token, { kind: "anthropic", threadId: "thread-ag", content: "Coba" });
     expect(failed.status).toBe(200);
     const { events, raw } = await readSse(failed);
 
-    expect(names(events)).toEqual(["error", "turn.settled"]);
-    expect(events[0].data.code).toBe("provider_error");
-    expect(typeof events[0].data.message).toBe("string");
-    expect(events[0].data.threadId).toBe("thread-ag");
+    // Story 3: thread.updated (tulis user) dulu, lalu error+settled.
+    expect(names(events)).toEqual(["thread.updated", "error", "turn.settled"]);
+    expect(events[1].data.code).toBe("provider_error");
+    expect(typeof events[1].data.message).toBe("string");
+    expect(events[1].data.threadId).toBe("thread-ag");
     // Log/respons hanya bentuk aman: kredensial tak pernah tampil utuh.
     expect(raw).not.toContain(apiKey);
 
@@ -277,10 +290,12 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
     expect(res.status).toBe(200);
 
     const { events, raw } = await readSse(res);
-    expect(names(events)).toEqual(["error", "turn.settled"]);
-    expect(events[0].data.code).toBe("no_provider_config");
-    expect(typeof events[0].data.message).toBe("string");
-    expect(events[1].data).toEqual({ threadId: events[0].data.threadId });
+    // Story 3: thread auto + thread.updated dulu (giliran tetap penulis),
+    // lalu error+settled.
+    expect(names(events)).toEqual(["thread.updated", "error", "turn.settled"]);
+    expect(events[1].data.code).toBe("no_provider_config");
+    expect(typeof events[1].data.message).toBe("string");
+    expect(events[2].data).toEqual({ threadId: events[1].data.threadId });
     expect(raw).not.toMatch(/sk-/);
   }, 30_000);
 
@@ -293,6 +308,7 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
 
     // Giliran openai sukses dulu di thread ini.
     const threadId = "thread-antar-jenis";
+    seedThread(db, user.userId, threadId);
     const openaiTurn = await readSse(
       await postTurn(app, user.token, { kind: "openai-compatible", threadId, content: "Untuk openai" }),
     );
@@ -307,8 +323,8 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
     const anthropicTurn = await readSse(
       await postTurn(app, user.token, { kind: "anthropic", threadId, content: "Untuk anthropic" }),
     );
-    expect(names(anthropicTurn.events)).toEqual(["error", "turn.settled"]);
-    expect(anthropicTurn.events[0].data.code).toBe("no_provider_config");
+    expect(names(anthropicTurn.events)).toEqual(["thread.updated", "error", "turn.settled"]);
+    expect(anthropicTurn.events[1].data.code).toBe("no_provider_config");
     expect(anthropicTurn.raw).not.toMatch(/sk-/);
     // Tiruan openai tak tersentuh oleh giliran kedua.
     expect(mock.requests).toHaveLength(1);

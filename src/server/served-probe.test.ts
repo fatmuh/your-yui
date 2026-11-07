@@ -212,6 +212,14 @@ function names(events: SseEvent[]): string[] {
   return events.map((frame) => frame.event);
 }
 
+/** Story 3: tanpa threadId di POST, thread dibuat server — id giliran
+ * diambil dari event final stream (kontrak: tepat satu final per giliran). */
+function threadIdFromEvents(events: SseEvent[]): string {
+  const final = events.find((frame) => frame.event === "message.final");
+  expect(final).toBeDefined();
+  return String(final!.data.threadId);
+}
+
 async function postTurn(
   cookie: string,
   body: Record<string, unknown>,
@@ -326,12 +334,11 @@ describe("probe build tersaji — anak proses produksi lewat HTTP+SSE nyata", ()
     expect(JSON.stringify(view)).not.toContain(OPENAI_API_KEY);
 
     const { events, raw } = await postTurn(cookie, {
-      threadId: "thread-served-openai",
       content: "Giliran uji openai pada proses penyajian",
       clientToken: "tok-served-openai",
     });
     assertFullContract(events, {
-      threadId: "thread-served-openai",
+      threadId: threadIdFromEvents(events),
       clientToken: "tok-served-openai",
       reply,
     });
@@ -363,12 +370,11 @@ describe("probe build tersaji — anak proses produksi lewat HTTP+SSE nyata", ()
 
     const { events, raw } = await postTurn(cookie, {
       kind: "anthropic",
-      threadId: "thread-served-anthropic",
       content: "Giliran uji anthropic pada proses penyajian",
       clientToken: "tok-served-anthropic",
     });
     assertFullContract(events, {
-      threadId: "thread-served-anthropic",
+      threadId: threadIdFromEvents(events),
       clientToken: "tok-served-anthropic",
       reply,
     });

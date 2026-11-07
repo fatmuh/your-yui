@@ -213,8 +213,9 @@ describe("DELETE /api/provider-configs/:kind", () => {
     });
     expect(turn.status).toBe(200);
     const { events } = await readSse(turn);
-    expect(events.map((frame) => frame.event)).toEqual(["error", "turn.settled"]);
-    expect(events[0].data.code).toBe("no_provider_config");
+    // Story 3: thread.updated (tulis user) kini mengalir sebelum error.
+    expect(events.map((frame) => frame.event)).toEqual(["thread.updated", "error", "turn.settled"]);
+    expect(events[1].data.code).toBe("no_provider_config");
 
     const again = await call(app, "DELETE", "openai-compatible", user.token);
     expect(again.status).toBe(404);
