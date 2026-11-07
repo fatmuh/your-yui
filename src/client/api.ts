@@ -201,9 +201,36 @@ export async function resolveActiveKind(): Promise<ProviderKind | null> {
   return null;
 }
 
-/** Body for POST /api/engine/turn — omit `threadId` to start a new thread. */
+/**
+ * POST /api/audio — store one voice-note blob for the session user and get
+ * back its id plus the mime/duration the server stored. The multipart body
+ * carries the audio `file` (content type preserved from the recording
+ * browser, which is the only side that knows the codec) and the integer
+ * `durationMs`; any non-ok response throws ApiError like every other route.
+ */
+export async function uploadAudioNote(
+  blob: Blob,
+  durationMs: number,
+): Promise<{ id: string; mime: string; durationMs: number }> {
+  const form = new FormData();
+  // The filename is irrelevant server-side (only the field name and the
+  // file's own content type are read), so any stable name works.
+  form.set("file", new File([blob], "voice.webm", { type: blob.type }));
+  form.set("durationMs", String(durationMs));
+  const response = await fetch("/api/audio", { method: "POST", body: form });
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as { id: string; mime: string; durationMs: number };
+}
+
+/**
+ * Body for POST /api/engine/turn — omit `threadId` to start a new thread.
+ * Exactly one of `content` (text) or `audioId` (an uploaded voice note) is
+ * sent: the server enforces the XOR, so this client always sends one and
+ * never both.
+ */
 export type StreamTurnInput = {
-  content: string;
+  content?: string;
+  audioId?: string;
   threadId?: string;
   clientToken?: string;
   /** Provider kind for this turn; omitted lets the server default apply. */

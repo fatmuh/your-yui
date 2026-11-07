@@ -15,7 +15,7 @@ import { useVoiceRecorder, voiceTime, type VoiceNote } from './useVoiceRecorder'
 import { VoiceNoteControls } from './VoiceNoteControls'
 import { VoiceCall } from './VoiceCall'
 import { useSession } from './SessionContext.tsx'
-import { ApiError, fetchThreadMessages, listThreads, resolveActiveKind, streamTurn } from './api.ts'
+import { ApiError, fetchThreadMessages, listThreads, resolveActiveKind, streamTurn, uploadAudioNote } from './api.ts'
 import type { YuiEvent } from '../shared/engine.ts'
 import './styles.css'
 
@@ -41,6 +41,10 @@ const openingChoices = [
   { key: 'C', label: 'Both' },
   { key: 'D', label: 'Something else' },
 ] as const
+// Client-side mirror of the server's 5 MB audio cap: a UX guard that skips
+// the request with a clear message, not a security boundary — the server
+// rejects oversized blobs on its own (src/server/audio/routes.ts).
+const VOICE_NOTE_MAX_BYTES = 5 * 1024 * 1024
 const makeConversation = (): Conversation => ({
   id: newId(),
   title: 'CFO',
@@ -130,12 +134,74 @@ export default function App() {
     return () => { cancelled = true }
   }, [])
   function sendVoiceNote(note: VoiceNote, chatId: string) {
+    // Same predicate sendMessage uses on `active`, evaluated against the
+    // conversation the recording started in: only the Yui contact uploads and
+    // streams a turn; every other conversation keeps the local path below.
+    const target = conversations.find(chat => chat.id === chatId)
+    if (target?.server || target?.bot === 'yui') {
+      sendServerVoiceNote(note, chatId, target.server === true)
+      return
+    }
     const url = URL.createObjectURL(note.blob)
     audioUrls.current.add(url)
     const message: Message = { id: newId(), role: 'user', text: `Voice note · ${voiceTime(note.duration)}`, audio: { url, duration: note.duration } }
     setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: [...chat.messages, message] } : chat))
     setNotice('Voice note added to this local chat. No audio was uploaded or transcribed.')
     requestAnimationFrame(() => inputRef.current?.focus())
+  }
+
+  // Server voice turn for the Yui contact: size guard → optimistic voice
+  // bubble → upload → turn {audioId} → streamed events, mirroring
+  // sendServerMessage. Every failure stage releases the composer and leaves no
+  // orphaned bubble or object URL behind.
+  function sendServerVoiceNote(note: VoiceNote, chatId: string, serverChat: boolean) {
+    if (note.blob.size > VOICE_NOTE_MAX_BYTES) {
+      // Nothing was created yet: refuse before any request or bubble.
+      setNotice('This recording is too large to send. Record a shorter one and try again.')
+      requestAnimationFrame(() => inputRef.current?.focus())
+      return
+    }
+    const url = URL.createObjectURL(note.blob)
+    audioUrls.current.add(url)
+    const message: Message = { id: newId(), role: 'user', text: `Voice note · ${voiceTime(note.duration)}`, audio: { url, duration: note.duration } }
+    setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: [...chat.messages, message] } : chat))
+    setTypingId(chatId)
+    void uploadAudioNote(note.blob, Math.round(note.duration * 1000))
+      .catch((error: unknown) => {
+        // The upload never landed: remove the optimistic bubble and revoke its
+        // object URL (the recording is dropped — v1 has no retry), then surface
+        // why. The typingId release is turn-scoped like everywhere else: a
+        // text turn may still be streaming in this chat (the recorder is not
+        // gated on typingId), and clearing it wholesale would unblock the
+        // composer under that stream.
+        setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: chat.messages.filter(item => item.id !== message.id) } : chat))
+        URL.revokeObjectURL(url)
+        audioUrls.current.delete(url)
+        setTypingId(current => current === chatId ? null : current)
+        setNotice(error instanceof ApiError ? error.message : 'Could not upload the voice note. Try again.')
+        requestAnimationFrame(() => inputRef.current?.focus())
+        return null
+      })
+      .then(uploaded => {
+        if (uploaded === null) return
+        const turn: TurnState = { chatId, threadId: serverChat ? chatId : undefined }
+        // Same per-send kind resolution as a text turn (two parallel GETs): a
+        // failure never blocks the turn — it goes out without `kind`.
+        void resolveActiveKind()
+          .catch(() => null)
+          .then(kind => streamTurn({ audioId: uploaded.id, threadId: turn.threadId, clientToken: newId(), kind: kind ?? undefined }, event => applyTurnEvent(turn, event)))
+          .catch((error: unknown) => {
+            // Pre-stream rejection or mid-stream failure: identical handling to
+            // sendServerMessage. The optimistic voice bubble stays (v1 has no
+            // auto-retry) and still plays — its object URL is backed by the
+            // local blob, not the server.
+            streamingMessageRef.current = null
+            setTypingId(current => current === (turn.threadId ?? turn.chatId) ? null : current)
+            if (error instanceof ApiError && error.code === 'unauthorized') setNotice('Session expired. Sign in again.')
+            else if (error instanceof ApiError) setNotice(error.message)
+            else setNotice('Could not reach Yui. Check your connection and try again.')
+          })
+      })
   }
   function cancelVoice() {
     voice.cancel()
@@ -547,7 +613,7 @@ export default function App() {
               </button>)}
             </div>
           </section> : <div key={message.id} className={`message-bubble animate-message whitespace-pre-wrap break-words ${message.role === 'user' ? 'message-user self-end' : 'message-assistant'}`}>
-            {message.audio ? <div className="voice-message"><span className="voice-message-label">{message.text}</span><audio controls preload="metadata" src={message.audio.url} aria-label={`Play voice note, ${voiceTime(message.audio.duration)}`} /><span className="voice-message-label">Local recording · No transcript</span></div> : message.text}
+            {message.audio ? <div className="voice-message"><span className="voice-message-label">{message.text}</span><audio controls preload="metadata" src={message.audio.url} aria-label={`Play voice note, ${voiceTime(message.audio.duration)}`} /><span className="voice-message-label">{active.server || active.bot === 'yui' ? 'Voice note' : 'Local recording · No transcript'}</span></div> : message.text}
             {!!message.files?.length && <div className="mt-2 flex flex-wrap gap-2">{message.files.map((file, index) => <span key={`${file}-${index}`} className="inline-flex max-w-full items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm"><FileText size={16} className="shrink-0" /><span className="attachment-name">{file}</span></span>)}</div>}
           </div>)}
           {typingId === active.id && <div className="typing-indicator flex items-center gap-3 pl-3 text-[#777777]" role="status"><Avatar appearance={active.appearance} variant={active.bot ?? 'cfo'} className="typing-avatar" /><span>Typing<span className="typing-dots">...</span></span></div>}

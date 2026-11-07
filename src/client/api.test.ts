@@ -12,6 +12,7 @@ import {
   registerUser,
   resolveActiveKind,
   streamTurn,
+  uploadAudioNote,
 } from "./api.ts";
 import type { ProviderKind, YuiEvent } from "../shared/engine.ts";
 
@@ -461,6 +462,76 @@ describe("resolveActiveKind", () => {
   });
 });
 
+const AUDIO_ID = "01JCAUDIOAUDIOAUDIOAUDIOAU01";
+
+describe("uploadAudioNote", () => {
+  it("posts multipart FormData (audio file + durationMs) to /api/audio and returns the stored view", async () => {
+    const mock = stubFetch(
+      jsonResponse(
+        { id: AUDIO_ID, mime: "audio/webm;codecs=opus", durationMs: 3000 },
+        201,
+      ),
+    );
+    const blob = new Blob([new Uint8Array([1, 2, 3, 4])], {
+      type: "audio/webm;codecs=opus",
+    });
+
+    const uploaded = await uploadAudioNote(blob, 3000);
+
+    expect(uploaded).toEqual({
+      id: AUDIO_ID,
+      mime: "audio/webm;codecs=opus",
+      durationMs: 3000,
+    });
+    const [url, init] = firstCall(mock);
+    expect(url).toBe("/api/audio");
+    expect(init.method).toBe("POST");
+    // Multipart, not JSON: the browser sets the content-type with the boundary.
+    expect(init.body).toBeInstanceOf(FormData);
+    expect(init.headers).toBeUndefined();
+    const form = init.body as FormData;
+    const file = form.get("file");
+    expect(file).toBeInstanceOf(File);
+    // The blob's content type rides along — only the recording browser knows
+    // the codec, so the server stores it verbatim.
+    expect((file as File).type).toBe("audio/webm;codecs=opus");
+    expect((file as File).size).toBe(4);
+    expect(form.get("durationMs")).toBe("3000");
+  });
+
+  it("413 envelope → ApiError payload_too_large", async () => {
+    stubFetch(
+      jsonResponse(
+        { error: { code: "payload_too_large", message: "Audio upload exceeds the 5 MB limit." } },
+        413,
+      ),
+    );
+    const blob = new Blob([new Uint8Array([1])], { type: "audio/webm" });
+
+    await expect(uploadAudioNote(blob, 1000)).rejects.toMatchObject({
+      name: "ApiError",
+      code: "payload_too_large",
+      message: "Audio upload exceeds the 5 MB limit.",
+    });
+  });
+
+  it("401 envelope → ApiError unauthorized", async () => {
+    stubFetch(
+      jsonResponse(
+        { error: { code: "unauthorized", message: "A valid session is required." } },
+        401,
+      ),
+    );
+    const blob = new Blob([new Uint8Array([1])], { type: "audio/webm" });
+
+    await expect(uploadAudioNote(blob, 1000)).rejects.toMatchObject({
+      name: "ApiError",
+      code: "unauthorized",
+      message: "A valid session is required.",
+    });
+  });
+});
+
 describe("streamTurn", () => {
   it("posts {content,clientToken} with no threadId key for a new thread and dispatches events in stream order", async () => {
     const mock = stubFetch(
@@ -565,6 +636,26 @@ describe("streamTurn", () => {
       content: "Next turn",
       threadId: THREAD_A,
     });
+  });
+
+  it("sends audioId with no content key for a voice turn", async () => {
+    const mock = stubFetch(sseResponse([sseFrame("turn.settled", { threadId: THREAD_A })]));
+
+    await streamTurn(
+      { audioId: AUDIO_ID, threadId: THREAD_A, clientToken: "01JCTOKENTOKENTOKENTOKENTOK01" },
+      () => undefined,
+    );
+
+    const [, init] = firstCall(mock);
+    // The server enforces content XOR audioId: the serialized body carries the
+    // audio id and no content key at all (never null, never "").
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body).toStrictEqual({
+      audioId: AUDIO_ID,
+      threadId: THREAD_A,
+      clientToken: "01JCTOKENTOKENTOKENTOKENTOK01",
+    });
+    expect("content" in body).toBe(false);
   });
 
   it("rejects with the envelope ApiError on a pre-stream 4xx response", async () => {
