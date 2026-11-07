@@ -8,7 +8,7 @@
  */
 
 /** Jenis penyedia yang dikenal v1. Story berikutnya menambah jenis kedua. */
-export type ProviderKind = "openai-compatible";
+export type ProviderKind = "openai-compatible" | "anthropic";
 
 /** Giliran uji v1 = teks (placeholder audio menyusul epic-voice). */
 export type TurnContent = string;

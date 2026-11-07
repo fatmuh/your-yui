@@ -7,7 +7,7 @@ import { sessionUser } from "../auth/service.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { getProviderConfig } from "../providers/store.ts";
 import { createEngineAdapter, EngineAdapterError } from "./adapter.ts";
-import type { YuiEvent } from "../../shared/engine.ts";
+import type { ProviderKind, YuiEvent } from "../../shared/engine.ts";
 
 // Route SSE giliran uji (R4, AD-9): satu POST = satu giliran penuh, respons
 // SSE memancarkan union event AD-4. Envelope error konvensi spine
@@ -15,6 +15,10 @@ import type { YuiEvent } from "../../shared/engine.ts";
 // kegagalan giliran mengalir sebagai event `error` + `turn.settled`.
 
 const MAX_CONTENT_CHARS = 8_000;
+
+/** Nilai union `ProviderKind` kontrak — validasi `body.kind` pra-stream. */
+const PROVIDER_KINDS: readonly ProviderKind[] = ["openai-compatible", "anthropic"];
+const DEFAULT_PROVIDER_KIND: ProviderKind = "openai-compatible";
 
 export function engineRoutes(db: YuiDatabase): Hono {
   const app = new Hono();
@@ -66,7 +70,26 @@ export function engineRoutes(db: YuiDatabase): Hono {
         ? rawClientToken
         : undefined;
 
-    const config = getProviderConfig(db, user.id, "openai-compatible");
+    // kind opsional (default openai-compatible) — nilai di luar union ditolak
+    // pra-stream dengan envelope konvensi.
+    const rawKind = body?.kind;
+    let kind: ProviderKind = DEFAULT_PROVIDER_KIND;
+    if (rawKind !== undefined) {
+      if (typeof rawKind !== "string" || !PROVIDER_KINDS.includes(rawKind as ProviderKind)) {
+        return c.json(
+          {
+            error: {
+              code: "invalid_request",
+              message: `Request body "kind" must be one of: ${PROVIDER_KINDS.join(", ")}.`,
+            },
+          },
+          400,
+        );
+      }
+      kind = rawKind as ProviderKind;
+    }
+
+    const config = getProviderConfig(db, user.id, kind);
     const { sessionId } = await adapter.createSession({
       userId: user.id,
       threadId,

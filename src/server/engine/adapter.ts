@@ -36,6 +36,58 @@ import type {
 /** Id penyedia di models.json sekali-pakai — internal adapter. */
 const PROVIDER_ID = "yui-openai";
 
+/**
+ * Konvensi baseUrl anthropic BERBEDA dari openai-completions: TANPA `/v1` —
+ * SDK Anthropic menambahkan path `/v1/messages` sendiri (distilasi kode engine
+ * terpasang). Endpoint default = produksi Anthropic; tes selalu menimpa baseUrl.
+ */
+const ANTHROPIC_PROVIDER_ID = "yui-anthropic";
+const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+/** Model stabil saat ini; layar config epic-percakapan bisa meng-override. */
+const DEFAULT_ANTHROPIC_MODEL_ID = "claude-sonnet-4-5";
+
+/**
+ * Entry provider models.json sekali-pakai hasil materialisasi per kind.
+ * Murni (tanpa I/O) — bisa diasersi unit tanpa giliran nyata (matriks
+ * "baseUrl null"): anthropic jatuh ke default, openai-compatible wajib lengkap.
+ */
+export type ProviderEntry = {
+  providerId: string;
+  api: "openai-completions" | "anthropic-messages";
+  baseUrl: string;
+  modelId: string;
+};
+
+/**
+ * Pilih entry provider per `config.kind`. Null = config openai-compatible
+ * tidak lengkap (baseUrl/modelId wajib untuk kind itu; kolom anthropic nullable
+ * karena punya default). Custom provider id sah untuk anthropic: engine
+ * merouting lewat field `api`, bukan nama penyedia.
+ */
+export function resolveProviderEntry(config: {
+  kind: string;
+  baseUrl: string | null;
+  modelId: string | null;
+}): ProviderEntry | null {
+  if (config.kind === "anthropic") {
+    return {
+      providerId: ANTHROPIC_PROVIDER_ID,
+      api: "anthropic-messages",
+      baseUrl: config.baseUrl ?? DEFAULT_ANTHROPIC_BASE_URL,
+      modelId: config.modelId ?? DEFAULT_ANTHROPIC_MODEL_ID,
+    };
+  }
+  if (!config.baseUrl || !config.modelId) {
+    return null;
+  }
+  return {
+    providerId: PROVIDER_ID,
+    api: "openai-completions",
+    baseUrl: config.baseUrl,
+    modelId: config.modelId,
+  };
+}
+
 /** Error adapter sebelum SSE mengalir; route memetakannya ke event error+settled. */
 export class EngineAdapterError extends Error {
   constructor(message: string) {
@@ -134,7 +186,10 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
       fail("no_provider_config", "No provider configuration is stored for this account.");
       return;
     }
-    if (!config.baseUrl || !config.modelId) {
+    // Materialisasi bercabang per kind: entry anthropic memakai default
+    // baseUrl/modelId bila kolomnya null; openai-compatible wajib lengkap.
+    const entry = resolveProviderEntry(config);
+    if (!entry) {
       fail("engine_setup_failed", "Stored provider configuration is incomplete (missing base URL or model id).");
       return;
     }
@@ -149,10 +204,10 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
         join(tempDir, "models.json"),
         JSON.stringify({
           providers: {
-            [PROVIDER_ID]: {
-              api: "openai-completions",
-              baseUrl: config.baseUrl,
-              models: [{ id: config.modelId }],
+            [entry.providerId]: {
+              api: entry.api,
+              baseUrl: entry.baseUrl,
+              models: [{ id: entry.modelId }],
             },
           },
         }),
@@ -181,8 +236,8 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
         authPath: join(tempDir, "auth.json"),
         modelsPath: join(tempDir, "models.json"),
       });
-      await runtime.setRuntimeApiKey(PROVIDER_ID, apiKey);
-      const model = runtime.getModel(PROVIDER_ID, config.modelId);
+      await runtime.setRuntimeApiKey(entry.providerId, apiKey);
+      const model = runtime.getModel(entry.providerId, entry.modelId);
       if (!model) {
         fail("engine_setup_failed", "Stored provider configuration does not resolve to a model.");
         return;
