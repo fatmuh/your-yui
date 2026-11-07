@@ -84,11 +84,12 @@ describe("migrasi schema dasar", () => {
 
     const raw = new Database(file);
     try {
-      // Dua migrasi ter-commit: fondasi (0000) + penyedia (0001).
+      // Tiga migrasi ter-commit: fondasi (0000) + penyedia (0001) + kolom
+      // masked_hint provider_configs (0002, story API config penyedia).
       const applied = raw
         .prepare("SELECT count(*) AS n FROM __drizzle_migrations")
         .get() as { n: number };
-      expect(applied.n).toBe(2);
+      expect(applied.n).toBe(3);
     } finally {
       raw.close();
     }

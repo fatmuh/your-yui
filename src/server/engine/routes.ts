@@ -7,7 +7,7 @@ import { sessionUser } from "../auth/service.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { getProviderConfig } from "../providers/store.ts";
 import { createEngineAdapter, EngineAdapterError } from "./adapter.ts";
-import type { ProviderKind, YuiEvent } from "../../shared/engine.ts";
+import { PROVIDER_KINDS, type ProviderKind, type YuiEvent } from "../../shared/engine.ts";
 
 // Route SSE giliran uji (R4, AD-9): satu POST = satu giliran penuh, respons
 // SSE memancarkan union event AD-4. Envelope error konvensi spine
@@ -16,16 +16,9 @@ import type { ProviderKind, YuiEvent } from "../../shared/engine.ts";
 
 const MAX_CONTENT_CHARS = 8_000;
 
-/**
- * Semua nilai union `ProviderKind` kontrak — `Record` memaksa kompilator
- * menjaga kelengkapan: nilai union baru tanpa entri di sini (atau entri tak
- * dikenal) gagal typecheck, bukan ditolak 400 diam-diam di runtime.
- */
-const KIND_SET: Record<ProviderKind, true> = {
-  "openai-compatible": true,
-  anthropic: true,
-};
-const PROVIDER_KINDS = Object.keys(KIND_SET) as ProviderKind[];
+// Validasi kind memakai PROVIDER_KINDS dari kontrak shared — satu sumber
+// kebenaran runtime (pola `Record<ProviderKind, true>` menjaga kelengkapan
+// union di kompilator; lihat src/shared/engine.ts).
 const DEFAULT_PROVIDER_KIND: ProviderKind = "openai-compatible";
 
 export function engineRoutes(db: YuiDatabase): Hono {

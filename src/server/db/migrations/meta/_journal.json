@@ -15,6 +15,13 @@
       "when": 1794007129626,
       "tag": "0001_whole_bedlam",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794011424817,
+      "tag": "0002_nasty_paper_doll",
+      "breakpoints": true
     }
   ]
 }

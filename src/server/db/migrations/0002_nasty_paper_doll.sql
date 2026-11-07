@@ -1,0 +1,1 @@
+ALTER TABLE `provider_configs` ADD `masked_hint` text DEFAULT '' NOT NULL;

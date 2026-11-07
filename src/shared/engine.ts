@@ -10,6 +10,19 @@
 /** Jenis penyedia yang dikenal v1. Story berikutnya menambah jenis kedua. */
 export type ProviderKind = "openai-compatible" | "anthropic";
 
+/**
+ * Satu-satunya list nilai `ProviderKind` di runtime (satu sumber — bukan
+ * salinan per-route). Kelengkapan union dijaga kompilator lewat pola
+ * `Record<ProviderKind, true>`: nilai union baru tanpa entri di sini gagal
+ * typecheck. Route yang memvalidasi kind (engine-turn, provider-configs)
+ * wajib memakai konstanta ini.
+ */
+const PROVIDER_KIND_SET: Record<ProviderKind, true> = {
+  "openai-compatible": true,
+  anthropic: true,
+};
+export const PROVIDER_KINDS = Object.keys(PROVIDER_KIND_SET) as ProviderKind[];
+
 /** Giliran uji v1 = teks (placeholder audio menyusul epic-voice). */
 export type TurnContent = string;
 

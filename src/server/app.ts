@@ -4,6 +4,7 @@ import { APP_ID, type HealthDto } from "../shared/app.ts";
 import type { YuiDatabase } from "./db/index.ts";
 import { authRoutes } from "./auth/routes.ts";
 import { engineRoutes } from "./engine/routes.ts";
+import { providerConfigRoutes } from "./providers/routes.ts";
 
 export function createApp(staticRoot = "dist", db?: YuiDatabase) {
   const app = new Hono();
@@ -13,11 +14,13 @@ export function createApp(staticRoot = "dist", db?: YuiDatabase) {
     return c.json(body);
   });
 
-  // Dengan DB (produksi/test): API auth + engine di-mount SEBELUM serveStatic
-  // agar /api/* tidak pernah jatuh ke file statis. Tanpa DB perilaku lama utuh.
+  // Dengan DB (produksi/test): API auth + engine + config penyedia di-mount
+  // SEBELUM serveStatic agar /api/* tidak pernah jatuh ke file statis.
+  // Tanpa DB perilaku lama utuh.
   if (db !== undefined) {
     app.route("/api", authRoutes(db));
     app.route("/api", engineRoutes(db));
+    app.route("/api", providerConfigRoutes(db));
   }
 
   // Production: serve the built client shell from dist/. Before `npm run build`

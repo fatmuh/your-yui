@@ -43,6 +43,10 @@ export const providerConfigs = sqliteTable(
     baseUrl: text("base_url"),
     modelId: text("model_id"),
     ciphertext: blob("ciphertext", { mode: "buffer" }).notNull(),
+    // Mask satu arah `sk-…abcd` (maskSecret) — dihitung SEKALI saat upsert,
+    // saat route masih memegang plaintext, lalu disimpan sebagai non-rahasia.
+    // View bermask dibaca dari sini; decrypt demi mask dilarang (AD-3).
+    maskedHint: text("masked_hint").notNull().default(""),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
   },
