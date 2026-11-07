@@ -16,6 +16,7 @@ npm run typecheck   # tsc -b
 npm test            # seluruh suite vitest
 npm run db:generate # regenerasi migrasi setelah ubah skema (drizzle-kit)
 node src/server/index.ts  # produksi: API + shell dist/ di PORT
+bash scripts/serve-live.sh  # production, supervised: auto-restarts the server and logs every exit code (prevents silent 502 outages behind a reverse proxy)
 ```
 
 ### Environment

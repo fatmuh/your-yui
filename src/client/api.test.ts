@@ -208,13 +208,24 @@ describe("fetchMe", () => {
 });
 
 describe("respons gagal tanpa envelope", () => {
-  it("502 body non-JSON → ApiError code unknown dengan status di message", async () => {
-    stubFetch(new Response("Bad Gateway", { status: 502 }));
+  it("proxy 502/503/504 with non-JSON body → ApiError unreachable with a friendly message", async () => {
+    for (const status of [502, 503, 504]) {
+      stubFetch(new Response("Bad Gateway", { status }));
+
+      await expect(fetchMe()).rejects.toMatchObject({
+        name: "ApiError",
+        code: "unreachable",
+        message: "The server is unreachable — it may be restarting. Try again in a moment.",
+      });
+    }
+  });
+
+  it("500 with non-JSON body keeps the generic unknown message", async () => {
+    stubFetch(new Response("Internal Server Error", { status: 500 }));
 
     await expect(fetchMe()).rejects.toMatchObject({
-      name: "ApiError",
       code: "unknown",
-      message: expect.stringContaining("502"),
+      message: "Unexpected response status 500",
     });
   });
 

@@ -37,7 +37,14 @@ export class ApiError extends Error {
  * Respons non-2xx → ApiError. Body JSON berbentuk {error:{code,message}}
  * dipakai apa adanya; selain itu (termasuk body non-JSON) jatuh ke
  * code "unknown" dengan message berisi status respons.
+ *
+ * Proxy statuses (502/503/504 — the app server itself never emits them) with
+ * a non-envelope body mean the reverse proxy cannot reach the backend, so the
+ * message becomes explicit for the user instead of "Unexpected response
+ * status 502".
  */
+const PROXY_UNREACHABLE_STATUSES = new Set([502, 503, 504]);
+
 async function toApiError(response: Response): Promise<ApiError> {
   let code = "unknown";
   let message = `Unexpected response status ${response.status}`;
@@ -58,6 +65,10 @@ async function toApiError(response: Response): Promise<ApiError> {
     }
   } catch {
     // Body bukan JSON — fallback unknown di atas sudah cukup.
+  }
+  if (code === "unknown" && PROXY_UNREACHABLE_STATUSES.has(response.status)) {
+    code = "unreachable";
+    message = "The server is unreachable — it may be restarting. Try again in a moment.";
   }
   return new ApiError(code, message);
 }
