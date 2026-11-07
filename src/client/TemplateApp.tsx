@@ -33,10 +33,10 @@ type Message = { id: string; role: 'assistant' | 'user'; text: string; files?: s
 // thread title is server-internal and NEVER adopted for display.
 // `loaded` marks a server conversation whose history is already in state
 // (lazy-loaded once, never refetched during the session).
-type Conversation = { id: string; botId: string; botName: string; messages: Message[]; server?: boolean; loaded?: boolean }
+export type Conversation = { id: string; botId: string; botName: string; messages: Message[]; server?: boolean; loaded?: boolean }
 // Per-turn stream context: the conversation the turn was sent from, plus the
 // server thread id once the first thread.updated event reveals it.
-type TurnState = { chatId: string; threadId?: string }
+export type TurnState = { chatId: string; threadId?: string }
 type Modal = 'apps' | 'create-bot' | 'settings' | null
 
 // Client-side mirror of the server's 5 MB audio cap: a UX guard that skips
@@ -70,6 +70,66 @@ export function historyToClientMessages(messages: MessageDto[]): Message[] {
     }
     return client
   })
+}
+
+/**
+ * PURE conversations transition for one streamed turn event — the
+ * unit-tested core of applyTurnEvent: (conversations, turn, event) → next
+ * conversations + next turn, touching no React state, refs, or id minting.
+ * The wrapper (applyTurnEvent) keeps everything impure: streaming-ref
+ * bookkeeping, active/typing id migration, and the error bubble (which
+ * depends on the ref and a fresh local id, so it cannot be a pure function
+ * of these three inputs). `turn` is the state as it was when the event
+ * arrived; the returned turn carries the thread id once the FIRST
+ * thread.updated of a thread-creating turn reveals it. Events whose
+ * conversation is gone (deleted mid-turn) leave the array reference
+ * unchanged, so React skips the re-render.
+ */
+export function applyTurnEventToConversations(conversations: Conversation[], turn: TurnState, event: YuiEvent): { conversations: Conversation[]; turn: TurnState } {
+  if (event.type === 'thread.updated') {
+    if (turn.threadId !== undefined) {
+      // Existing thread: keep the freshest conversation at the top of the list.
+      const index = conversations.findIndex(chat => chat.id === event.threadId)
+      if (index === -1) return { conversations, turn }
+      return { conversations: [conversations[index], ...conversations.filter((_, i) => i !== index)], turn }
+    }
+    // First event of a thread-creating turn: migrate the placeholder
+    // conversation id (`bot:…`) to the server thread id — the conversation
+    // becomes server-backed from here on. The bot's own name stays the
+    // display identity; the derived title in the event is IGNORED for
+    // display (server-internal, for future search). Its local transcript
+    // already IS the thread's full history, so it counts as loaded.
+    const next: TurnState = { ...turn, threadId: event.threadId }
+    const index = conversations.findIndex(chat => chat.id === turn.chatId)
+    if (index === -1) return { conversations, turn: next }
+    const migrated: Conversation = { ...conversations[index], id: event.threadId, server: true, loaded: true }
+    // A delayed mount response can already have added the thread's own
+    // row under the new thread id — drop it too, or the id would exist
+    // twice (duplicate keys; every event upsert would hit both rows).
+    // The migrated conversation keeps the real local transcript.
+    return {
+      conversations: [migrated, ...conversations.filter(chat => chat.id !== turn.chatId && chat.id !== event.threadId)],
+      turn: next,
+    }
+  }
+  if (event.type === 'message.delta' || event.type === 'message.final') {
+    // Upsert the in-progress assistant bubble keyed by the event's
+    // messageId; the text is CUMULATIVE, so it replaces instead of appending.
+    return {
+      conversations: conversations.map(chat => {
+        if (chat.id !== event.threadId) return chat
+        const at = chat.messages.findIndex(message => message.id === event.messageId)
+        return {
+          ...chat,
+          messages: at === -1
+            ? [...chat.messages, { id: event.messageId, role: 'assistant' as const, text: event.text }]
+            : chat.messages.map((message, index) => index === at ? { ...message, text: event.text } : message),
+        }
+      }),
+      turn,
+    }
+  }
+  return { conversations, turn }
 }
 
 /** Sidebar + pane "no bots yet" empty state (I/O matrix row "User tanpa bot"). */
@@ -156,7 +216,13 @@ export default function App() {
             ? { id: botPlaceholderId(bot.id), botId: bot.id, botName: bot.name, messages: [] }
             : { id: thread.id, botId: bot.id, botName: bot.name, server: true, messages: [] }
         })
-        setConversations(mapped)
+        // Merge, not replace: a conversation created while this fetch was
+        // pending (e.g. a bot created via the sidebar button) is unknown to
+        // `mapped` — keep it instead of wiping it when the response lands.
+        setConversations(current => {
+          const known = new Set(mapped.map(chat => chat.id))
+          return [...mapped, ...current.filter(chat => !known.has(chat.id))]
+        })
         setActiveId(current => current !== null && mapped.some(chat => chat.id === current) ? current : mapped[0]?.id ?? null)
         setReady(true)
       })
@@ -378,7 +444,7 @@ export default function App() {
   // conversation id, or delete the bot (server cascade). Rename/pin/section
   // were demo-seed features — bots are immutable after creation.
   const botMenuItems: ChatMenuItem[] = [
-    { id: 'copy', label: 'Copy conversation ID', icon: Copy, separator: true },
+    { id: 'copy', label: 'Copy conversation ID', icon: Copy },
     { id: 'delete', label: 'Delete bot', icon: Trash2 },
   ]
 
@@ -427,62 +493,17 @@ export default function App() {
       })
   }
 
-  // Apply one streamed server event to conversation state. Every update goes
-  // through functional setConversations, so events arriving after the user
-  // deleted the conversation simply find no match and are ignored silently.
+  // Apply one streamed server event to conversation state. The PURE
+  // conversations transition lives in applyTurnEventToConversations and is
+  // invoked through functional setConversations, so events arriving after
+  // the user deleted the conversation simply find no match and are ignored
+  // silently. What stays here is the state the helper must not touch.
   function applyTurnEvent(turn: TurnState, event: YuiEvent): void {
-    if (event.type === 'thread.updated') {
-      if (turn.threadId === undefined) {
-        // First event of a thread-creating turn: migrate the placeholder
-        // conversation id (`bot:…`) to the server thread id — the conversation
-        // becomes server-backed from here on. The bot's own name stays the
-        // display identity; the derived title in the event is IGNORED for
-        // display (server-internal, for future search). Its local transcript
-        // already IS the thread's full history, so it counts as loaded.
-        turn.threadId = event.threadId
-        const localId = turn.chatId
-        const threadId = event.threadId
-        setConversations(current => {
-          const index = current.findIndex(chat => chat.id === localId)
-          if (index === -1) return current
-          const migrated: Conversation = { ...current[index], id: threadId, server: true, loaded: true }
-          // A delayed mount response can already have added the thread's own
-          // row under the new thread id — drop it too, or the id would exist
-          // twice (duplicate keys; every event upsert would hit both rows).
-          // The migrated conversation keeps the real local transcript.
-          return [migrated, ...current.filter(chat => chat.id !== localId && chat.id !== threadId)]
-        })
-        setActiveId(current => current === localId ? threadId : current)
-        setTypingId(current => current === localId ? threadId : current)
-        return
-      }
-      // Existing thread: keep the freshest conversation at the top of the list.
-      setConversations(current => {
-        const index = current.findIndex(chat => chat.id === event.threadId)
-        if (index === -1) return current
-        return [current[index], ...current.filter((_, i) => i !== index)]
-      })
-      return
-    }
-    if (event.type === 'message.delta' || event.type === 'message.final') {
-      // Upsert the in-progress assistant bubble keyed by the event's
-      // messageId; the text is CUMULATIVE, so it replaces instead of appending.
-      streamingMessageRef.current = { chatId: event.threadId, messageId: event.messageId }
-      setConversations(current => current.map(chat => {
-        if (chat.id !== event.threadId) return chat
-        const at = chat.messages.findIndex(message => message.id === event.messageId)
-        return {
-          ...chat,
-          messages: at === -1
-            ? [...chat.messages, { id: event.messageId, role: 'assistant' as const, text: event.text }]
-            : chat.messages.map((message, index) => index === at ? { ...message, text: event.text } : message),
-        }
-      }))
-      return
-    }
     if (event.type === 'error') {
       // Show the failure in-thread: replace the in-progress bubble (if any)
       // with the error text, or append one when nothing had streamed yet.
+      // Deliberately NOT in the helper: it reads the streaming ref and mints
+      // a fresh local id, so it is not a pure function of the event.
       const text = `[error] ${event.message}`
       const inProgress = streamingMessageRef.current
       streamingMessageRef.current = null
@@ -493,6 +514,30 @@ export default function App() {
         }
         return { ...chat, messages: [...chat.messages, { id: newId(), role: 'assistant' as const, text }] }
       }))
+      return
+    }
+    // Frozen pre-event copy for the helper: `turn` is the mutable per-turn
+    // object the stream closures share and is updated below, while React may
+    // run the functional updater only later — the helper must see the turn as
+    // it was when the event arrived.
+    const before: TurnState = { chatId: turn.chatId, threadId: turn.threadId }
+    setConversations(current => applyTurnEventToConversations(current, before, event).conversations)
+    if (event.type === 'thread.updated' && before.threadId === undefined) {
+      // First event of a thread-creating turn: the helper migrated the
+      // placeholder id (`bot:…`) to the server thread id. The active and
+      // typing ids must follow, so focus and the composer stay on the SAME
+      // conversation now living under the thread id.
+      turn.threadId = event.threadId
+      const localId = before.chatId
+      const threadId = event.threadId
+      setActiveId(current => current === localId ? threadId : current)
+      setTypingId(current => current === localId ? threadId : current)
+      return
+    }
+    if (event.type === 'message.delta' || event.type === 'message.final') {
+      // The helper upserted the in-progress assistant bubble; remember it so
+      // a later `error` can replace this exact bubble in place.
+      streamingMessageRef.current = { chatId: event.threadId, messageId: event.messageId }
       return
     }
     // turn.settled is always the last event: release the composer — but only

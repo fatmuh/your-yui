@@ -180,7 +180,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .palette-footer { gap: 10px; padding-inline: 12px; }
 }
 
-.bot-shortcuts { display: flex; flex-wrap: wrap; justify-content: center; align-items: start; gap: 12px; padding-inline: 16px; max-height: 40dvh; overflow-y: auto; flex-shrink: 0; }
+.bot-shortcuts { display: flex; flex-wrap: wrap; justify-content: center; align-items: start; gap: 12px; padding-inline: 16px; }
 .bot-shortcuts:empty { display: none; }
 .bot-shortcut-wrap { position: relative; width: 76px; }
 .bot-shortcut { display: flex; align-items: center; flex-direction: column; width: 100%; padding: 6px; border-radius: 14px; -webkit-touch-callout: none; user-select: none; }

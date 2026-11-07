@@ -113,10 +113,11 @@ export type CreatedThread = {
 };
 
 /**
- * Thread baru (ULID server, judul turunan) + pesan user pertamanya, terikat
- * bot `botId` milik `userId`. Null bila bot tak ada ATAU milik orang lain —
- * route memetakan null → 404 identik (anti-enumeration) TANPA menulis apa pun
- * (multi-bot harness: thread lahir terikat bot; binding tak pernah berubah).
+ * New thread (server ULID, derived title) plus its first user message, bound
+ * to bot `botId` owned by `userId`. Null when the bot is missing OR someone
+ * else's — the route maps null → an identical 404 (anti-enumeration) WITHOUT
+ * writing anything (multi-bot harness: a thread is born bound to its bot;
+ * the binding never changes).
  */
 export function createThreadWithMessage(
   db: YuiDatabase,

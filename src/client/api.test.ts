@@ -17,7 +17,8 @@ import {
   streamTurn,
   uploadAudioNote,
 } from "./api.ts";
-import { historyToClientMessages } from "./TemplateApp.tsx";
+import { applyTurnEventToConversations, historyToClientMessages } from "./TemplateApp.tsx";
+import type { Conversation, TurnState } from "./TemplateApp.tsx";
 import type { MessageDto } from "../shared/app.ts";
 import type { ProviderKind, YuiEvent } from "../shared/engine.ts";
 
@@ -354,6 +355,44 @@ describe("historyToClientMessages", () => {
 
   it("returns an empty array for empty history", () => {
     expect(historyToClientMessages([])).toEqual([]);
+  });
+});
+
+describe("applyTurnEventToConversations", () => {
+  it("thread-creating thread.updated migrates the placeholder id and the display name stays the BOT's name", () => {
+    // A bot conversation before its first turn: local placeholder id
+    // `bot:<botId>`, optimistic user bubble already in the transcript.
+    const placeholder: Conversation = {
+      id: "bot:01JBOTPLACEHOLDERBOT000001",
+      botId: "01JBOTPLACEHOLDERBOT000001",
+      botName: "Chef",
+      messages: [{ id: "m-optimistic", role: "user", text: "What is for dinner?" }],
+    };
+    const turn: TurnState = { chatId: placeholder.id };
+    const event: YuiEvent = {
+      type: "thread.updated",
+      threadId: "01JTHREADSERVERTHREAD0001",
+      title: "Some derived title",
+      updated_at: "2026-11-07T10:00:00.000Z",
+    };
+
+    const result = applyTurnEventToConversations([placeholder], turn, event);
+
+    // The placeholder row is REPLACED by a server-backed row under the thread
+    // id, marked loaded (its local transcript already IS the thread history).
+    expect(result.conversations).toHaveLength(1);
+    expect(result.conversations[0].id).toBe(event.threadId);
+    expect(result.conversations[0].server).toBe(true);
+    expect(result.conversations[0].loaded).toBe(true);
+    expect(result.conversations[0].messages).toEqual(placeholder.messages);
+    // I/O matrix "display name stays the bot's name": botName is unchanged
+    // and the derived title is NEVER adopted — no title-derived field is set
+    // on the conversation.
+    expect(result.conversations[0].botName).toBe("Chef");
+    expect(result.conversations[0]).not.toHaveProperty("title");
+    // The turn learns the thread id for the rest of the stream.
+    expect(result.turn.chatId).toBe(placeholder.id);
+    expect(result.turn.threadId).toBe(event.threadId);
   });
 });
 

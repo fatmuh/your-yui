@@ -85,7 +85,7 @@ function seedThread(db: YuiDatabase, userId: string, threadId: string): void {
   db.insert(threads).values({ id: threadId, userId, createdAt: now, updatedAt: now }).run();
 }
 
-/** Bot milik sesi — giliran tanpa threadId kini wajib menamai bot-nya. */
+/** Session-owned bot — a turn without threadId must now name its bot. */
 function seedBot(db: YuiDatabase, userId: string, name = "Bot uji"): string {
   return insertBot(db, userId, { name, persona: "" }).id;
 }

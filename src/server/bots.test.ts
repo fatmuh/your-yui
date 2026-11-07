@@ -409,6 +409,9 @@ describe("turn ↔ bot binding (POST /api/engine/turn)", () => {
     expect(mock.requests[0].body).toContain(persona);
     expect(mock.requests[0].body).toContain("What is for dinner?");
     expect(mock.requests[0].body).not.toContain(DEFAULT_BOT_PERSONA);
+    // ...and the ENGINE's own default coding prompt is absent too — the
+    // replacement is total, not persona appended to a stock prompt.
+    expect(mock.requests[0].body).not.toContain("coding assistant");
 
     // The thread row is bound at creation and the binding is visible on the
     // thread list projection (the client keys its bot↔thread mapping on it).

@@ -203,8 +203,8 @@ describe("DELETE /api/provider-configs/:kind", () => {
 
     expect((await call(app, "GET", "openai-compatible", user.token)).status).toBe(404);
 
-    // Giliran berikutnya: engine tak lagi menemukan config → no_provider_config.
-    // Giliran tanpa threadId wajib menamai bot-nya (multi-bot harness).
+    // Next turn: the engine no longer finds a config → no_provider_config.
+    // A turn without threadId must name its bot (multi-bot harness).
     const botId = insertBot(db, user.userId, { name: "Bot uji", persona: "" }).id;
     const turn = await app.request("/api/engine/turn", {
       method: "POST",

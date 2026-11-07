@@ -96,14 +96,14 @@ async function fetchHistory(
 /** Fixture thread milik sesi (story 3: threadId string kini wajib thread
  * milik pengguna — bukan id ephemeral arbiter). Test boleh menulis langsung
  * lewat drizzle; penulis tunggal AD-5 berlaku untuk client, bukan untuk test.
- * `botId` opsional mengikat thread ke bot (multi-bot harness); null = baris
- * pra-0005, jalur defensif persona bawaan di route. */
+ * `botId` optionally binds the thread to a bot (multi-bot harness); null = a
+ * pre-0005 row, the route's default-persona defensive path. */
 function seedThread(db: YuiDatabase, userId: string, threadId: string, botId: string | null = null): void {
   const now = Date.now();
   db.insert(threads).values({ id: threadId, userId, botId, createdAt: now, updatedAt: now }).run();
 }
 
-/** Bot milik sesi — giliran tanpa threadId kini wajib menamai bot-nya. */
+/** Session-owned bot — a turn without threadId must now name its bot. */
 function seedBot(db: YuiDatabase, userId: string, name = "Bot uji", persona = ""): string {
   return insertBot(db, userId, { name, persona }).id;
 }
@@ -135,8 +135,8 @@ describe("POST /api/engine/turn — matriks story", () => {
     const user = await registerUser(app, "arjuna");
     const apiKey = "sk-live-uji-1234567890abcd";
     seedConfig(db, user.userId, mock, apiKey);
-    // Happy path terikat bot ber-persona kustom: persona adalah pengganti
-    // PENUH prompt sistem engine — harus sampai ke penyedia apa adanya.
+    // Happy path bound to a custom-persona bot: the persona is a FULL
+    // replacement of the engine's system prompt — it must reach the provider as-is.
     const persona = "You are a study coach; you only run spaced-repetition review sessions.";
     const botId = seedBot(db, user.userId, "Coach", persona);
     seedThread(db, user.userId, "thread-uji-1", botId);
@@ -193,8 +193,8 @@ describe("POST /api/engine/turn — matriks story", () => {
     expect(mock.requests[0].authorization).toBe(`Bearer ${apiKey}`);
     expect(mock.requests[0].url).toBe("/v1/chat/completions");
     expect(mock.requests[0].body).toContain("Giliran uji pertama");
-    // Persona pengganti penuh bot terikat thread sampai utuh, DAN prompt
-    // coding-agent bawaan engine tidak pernah ikut (multi-bot harness).
+    // The thread-bound bot's full-replacement persona arrives whole, AND the
+    // engine's default coding-agent prompt never tags along (multi-bot harness).
     expect(mock.requests[0].body).toContain(persona);
     expect(mock.requests[0].body).not.toContain(DEFAULT_BOT_PERSONA);
     expect(raw).not.toContain(apiKey);
@@ -351,8 +351,8 @@ describe("POST /api/engine/turn — matriks story", () => {
     const botA = seedBot(db, userA.userId, "Bot alpha");
     const botB = seedBot(db, userB.userId, "Bot bravo");
 
-    // Tanpa threadId → thread auto per pengguna untuk bot masing-masing
-    // (semantik story 3 + binding multi-bot).
+    // Without threadId → the per-user auto thread for each user's own bot
+    // (story 3 semantics + the multi-bot binding).
     const turnA = await postTurn(app, userA.token, { content: "Untuk alpha", botId: botA });
     const turnB = await postTurn(app, userB.token, { content: "Untuk bravo", botId: botB });
     const eventsA = await readSse(turnA);

@@ -98,7 +98,7 @@ function seedThread(db: YuiDatabase, userId: string): string {
   return threadId;
 }
 
-/** Bot milik sesi — giliran tanpa threadId kini wajib menamai bot-nya. */
+/** Session-owned bot — a turn without threadId must now name its bot. */
 function seedBot(db: YuiDatabase, userId: string, name = "Bot uji", persona = ""): string {
   return insertBot(db, userId, { name, persona }).id;
 }
@@ -146,13 +146,13 @@ describe("dua giliran satu thread (konteks multi-giliran server-side)", () => {
     openMocks.push(mock);
     const user = await registerUser(app, "dua-giliran");
     seedConfig(db, user.userId, mock, "sk-live-dua-11112222aaaa");
-    // Bot ber-persona kustom: giliran baru wajib menamai bot-nya, dan persona
-    // bot (pengganti penuh) harus sampai ke penyedia.
+    // Custom-persona bot: a new turn must name its bot, and the bot's
+    // persona (a full replacement) must reach the provider.
     const persona = "You are a weekend trip planner; you only discuss short getaways.";
     const botId = seedBot(db, user.userId, "Travel", persona);
 
-    // Giliran 1 — threadId ABSENT: server membuat thread (ULID server) untuk
-    // bot yang dinamai botId.
+    // Turn 1 — threadId ABSENT: the server creates the thread (server ULID)
+    // for the bot named by botId.
     const first = await readSse(
       await postTurn(app, user.token, {
         content: "Pertanyaan giliran pertama",
@@ -199,8 +199,8 @@ describe("dua giliran satu thread (konteks multi-giliran server-side)", () => {
     expect(mock.requests[1]!.body).toContain("user: Pertanyaan giliran pertama");
     expect(mock.requests[1]!.body).toContain(`assistant: ${reply}`);
     expect(mock.requests[1]!.body).toContain("user: Pertanyaan giliran kedua");
-    // Persona pengganti penuh sampai ke penyedia di KEDUA giliran (thread baru
-    // membawa bot-nya; giliran lanjutan memakai bot thread itu juga).
+    // The full-replacement persona reaches the provider on BOTH turns (a new
+    // thread carries its bot; follow-up turns use that thread's bot too).
     expect(mock.requests[0]!.body).toContain(persona);
     expect(mock.requests[1]!.body).toContain(persona);
 
