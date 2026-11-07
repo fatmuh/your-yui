@@ -16,8 +16,16 @@ import type { ProviderKind, YuiEvent } from "../../shared/engine.ts";
 
 const MAX_CONTENT_CHARS = 8_000;
 
-/** Nilai union `ProviderKind` kontrak — validasi `body.kind` pra-stream. */
-const PROVIDER_KINDS: readonly ProviderKind[] = ["openai-compatible", "anthropic"];
+/**
+ * Semua nilai union `ProviderKind` kontrak — `Record` memaksa kompilator
+ * menjaga kelengkapan: nilai union baru tanpa entri di sini (atau entri tak
+ * dikenal) gagal typecheck, bukan ditolak 400 diam-diam di runtime.
+ */
+const KIND_SET: Record<ProviderKind, true> = {
+  "openai-compatible": true,
+  anthropic: true,
+};
+const PROVIDER_KINDS = Object.keys(KIND_SET) as ProviderKind[];
 const DEFAULT_PROVIDER_KIND: ProviderKind = "openai-compatible";
 
 export function engineRoutes(db: YuiDatabase): Hono {

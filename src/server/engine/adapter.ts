@@ -136,12 +136,11 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
     const key = pairKey(input.userId, input.threadId);
     const existing = sessionsByKey.get(key);
     if (existing) {
-      // Idempoten per (userId, threadId), tapi binding config di-refresh bila
-      // pemanggil kini memegang config (session lama bisa lahir saat pengguna
-      // belum punya config — null jangan menempel selamanya).
-      if (input.providerConfigId !== null) {
-        existing.providerConfigId = input.providerConfigId;
-      }
+      // Idempoten per (userId, threadId); binding config SELALU di-refresh
+      // dari panggilan terkini, termasuk null (latest-call-wins): giliran
+      // kind lain yang belum punya config tak boleh mewarisi config kind
+      // sebelumnya di thread yang sama.
+      existing.providerConfigId = input.providerConfigId;
       return { sessionId: existing.sessionId };
     }
     const record: SessionRecord = {

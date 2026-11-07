@@ -353,6 +353,36 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
     expect(raw).not.toMatch(/sk-/);
   }, 30_000);
 
+  it("binding sesi latest-call-wins antar kind: giliran kind tanpa config tak mewarisi config kind lain di thread sama", async () => {
+    const { app, db } = makeApp();
+    const mock = await startMockOpenAI({ replyText: "Balasan openai di thread ini." });
+    openMocks.push(mock);
+    const user = await registerUser(app, "antar-jenis");
+    seedOpenAiConfig(db, user.userId, mock, "sk-live-openai-thread-8888abcd");
+
+    // Giliran openai sukses dulu di thread ini.
+    const threadId = "thread-antar-jenis";
+    const openaiTurn = await readSse(
+      await postTurn(app, user.token, { kind: "openai-compatible", threadId, content: "Untuk openai" }),
+    );
+    expect(names(openaiTurn.events)).toEqual(
+      expect.arrayContaining(["message.final", "turn.settled"]),
+    );
+    expect(mock.requests).toHaveLength(1);
+
+    // Giliran kind anthropic di thread YANG SAMA tanpa config anthropic:
+    // binding openai lama TIDAK diwarisi — no_provider_config, bukan giliran
+    // openai terselubung (matriks "Tanpa config anthropic").
+    const anthropicTurn = await readSse(
+      await postTurn(app, user.token, { kind: "anthropic", threadId, content: "Untuk anthropic" }),
+    );
+    expect(names(anthropicTurn.events)).toEqual(["error", "turn.settled"]);
+    expect(anthropicTurn.events[0].data.code).toBe("no_provider_config");
+    expect(anthropicTurn.raw).not.toMatch(/sk-/);
+    // Tiruan openai tak tersentuh oleh giliran kedua.
+    expect(mock.requests).toHaveLength(1);
+  }, 30_000);
+
   it("kind invalid: 400 invalid_request pra-stream (envelope), bukan SSE", async () => {
     const { app } = makeApp();
     const user = await registerUser(app, "kind-invalid");
