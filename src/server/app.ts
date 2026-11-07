@@ -4,6 +4,7 @@ import { APP_ID, type HealthDto } from "../shared/app.ts";
 import type { YuiDatabase } from "./db/index.ts";
 import { audioRoutes } from "./audio/routes.ts";
 import { authRoutes } from "./auth/routes.ts";
+import { botRoutes } from "./bots/routes.ts";
 import { conversationRoutes } from "./conversations/routes.ts";
 import { engineRoutes } from "./engine/routes.ts";
 import { providerConfigRoutes } from "./providers/routes.ts";
@@ -39,6 +40,7 @@ export function createApp(staticRoot = "dist", db?: YuiDatabase) {
     app.route("/api", providerConfigRoutes(db));
     app.route("/api", conversationRoutes(db));
     app.route("/api", audioRoutes(db));
+    app.route("/api", botRoutes(db));
   }
 
   // PWA (epic-pwa): the service worker script must always be revalidated.

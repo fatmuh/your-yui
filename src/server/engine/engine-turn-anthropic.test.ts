@@ -7,6 +7,7 @@ import type { Hono } from "hono";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
 import { threads } from "../db/schema.ts";
+import { insertBot } from "../bots/store.ts";
 import { upsertProviderConfig } from "../providers/store.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../../tests/helpers/mock-openai.ts";
 import { startMockAnthropic, type MockAnthropic } from "../../../tests/helpers/mock-anthropic.ts";
@@ -82,6 +83,11 @@ function names(events: SseEvent[]): string[] {
 function seedThread(db: YuiDatabase, userId: string, threadId: string): void {
   const now = Date.now();
   db.insert(threads).values({ id: threadId, userId, createdAt: now, updatedAt: now }).run();
+}
+
+/** Bot milik sesi — giliran tanpa threadId kini wajib menamai bot-nya. */
+function seedBot(db: YuiDatabase, userId: string, name = "Bot uji"): string {
+  return insertBot(db, userId, { name, persona: "" }).id;
 }
 
 afterEach(() => {
@@ -265,8 +271,9 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
     openMocks.push(cut);
     const user = await registerUser(app, "anthropic-putus");
     seedAnthropicConfig(db, user.userId, cut, "sk-ant-api-putus-7777wxyz");
+    const botId = seedBot(db, user.userId);
 
-    const res = await postTurn(app, user.token, { kind: "anthropic", content: "Coba putus" });
+    const res = await postTurn(app, user.token, { kind: "anthropic", content: "Coba putus", botId });
     expect(res.status).toBe(200);
     const { events, raw } = await readSse(res);
 
@@ -283,10 +290,11 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
   }, 30_000);
 
   it("tanpa config anthropic: no_provider_config + turn.settled, tanpa leak", async () => {
-    const { app } = makeApp();
+    const { app, db } = makeApp();
     const user = await registerUser(app, "anthropic-tanpa-config");
+    const botId = seedBot(db, user.userId);
 
-    const res = await postTurn(app, user.token, { kind: "anthropic", content: "Halo" });
+    const res = await postTurn(app, user.token, { kind: "anthropic", content: "Halo", botId });
     expect(res.status).toBe(200);
 
     const { events, raw } = await readSse(res);

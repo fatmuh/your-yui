@@ -9,6 +9,8 @@ import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
 import { messages, threads } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
+import { insertBot } from "../bots/store.ts";
+import { DEFAULT_BOT_PERSONA } from "../../shared/app.ts";
 import { upsertProviderConfig } from "../providers/store.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../../tests/helpers/mock-openai.ts";
 import { postTurn, registerUser } from "../../../tests/helpers/api.ts";
@@ -93,10 +95,17 @@ async function fetchHistory(
 
 /** Fixture thread milik sesi (story 3: threadId string kini wajib thread
  * milik pengguna — bukan id ephemeral arbiter). Test boleh menulis langsung
- * lewat drizzle; penulis tunggal AD-5 berlaku untuk client, bukan untuk test. */
-function seedThread(db: YuiDatabase, userId: string, threadId: string): void {
+ * lewat drizzle; penulis tunggal AD-5 berlaku untuk client, bukan untuk test.
+ * `botId` opsional mengikat thread ke bot (multi-bot harness); null = baris
+ * pra-0005, jalur defensif persona bawaan di route. */
+function seedThread(db: YuiDatabase, userId: string, threadId: string, botId: string | null = null): void {
   const now = Date.now();
-  db.insert(threads).values({ id: threadId, userId, createdAt: now, updatedAt: now }).run();
+  db.insert(threads).values({ id: threadId, userId, botId, createdAt: now, updatedAt: now }).run();
+}
+
+/** Bot milik sesi — giliran tanpa threadId kini wajib menamai bot-nya. */
+function seedBot(db: YuiDatabase, userId: string, name = "Bot uji", persona = ""): string {
+  return insertBot(db, userId, { name, persona }).id;
 }
 
 afterEach(() => {
@@ -126,7 +135,11 @@ describe("POST /api/engine/turn — matriks story", () => {
     const user = await registerUser(app, "arjuna");
     const apiKey = "sk-live-uji-1234567890abcd";
     seedConfig(db, user.userId, mock, apiKey);
-    seedThread(db, user.userId, "thread-uji-1");
+    // Happy path terikat bot ber-persona kustom: persona adalah pengganti
+    // PENUH prompt sistem engine — harus sampai ke penyedia apa adanya.
+    const persona = "You are a study coach; you only run spaced-repetition review sessions.";
+    const botId = seedBot(db, user.userId, "Coach", persona);
+    seedThread(db, user.userId, "thread-uji-1", botId);
 
     const res = await postTurn(app, user.token, {
       threadId: "thread-uji-1",
@@ -180,14 +193,19 @@ describe("POST /api/engine/turn — matriks story", () => {
     expect(mock.requests[0].authorization).toBe(`Bearer ${apiKey}`);
     expect(mock.requests[0].url).toBe("/v1/chat/completions");
     expect(mock.requests[0].body).toContain("Giliran uji pertama");
+    // Persona pengganti penuh bot terikat thread sampai utuh, DAN prompt
+    // coding-agent bawaan engine tidak pernah ikut (multi-bot harness).
+    expect(mock.requests[0].body).toContain(persona);
+    expect(mock.requests[0].body).not.toContain(DEFAULT_BOT_PERSONA);
     expect(raw).not.toContain(apiKey);
   }, 30_000);
 
   it("tanpa config tersimpan: 1 error (tanpa kredensial) + turn.settled; engine tak tersentuh", async () => {
-    const { app } = makeApp();
+    const { app, db } = makeApp();
     const user = await registerUser(app, "tanpa-config");
+    const botId = seedBot(db, user.userId);
 
-    const res = await postTurn(app, user.token, { content: "Halo" });
+    const res = await postTurn(app, user.token, { content: "Halo", botId });
     expect(res.status).toBe(200);
 
     const { events, raw } = await readSse(res);
@@ -278,8 +296,9 @@ describe("POST /api/engine/turn — matriks story", () => {
     openMocks.push(cut);
     const user = await registerUser(app, "mid-stream");
     seedConfig(db, user.userId, cut, "sk-live-putus-7777wxyz");
+    const botId = seedBot(db, user.userId);
 
-    const res = await postTurn(app, user.token, { content: "Coba putus" });
+    const res = await postTurn(app, user.token, { content: "Coba putus", botId });
     expect(res.status).toBe(200);
     const { events } = await readSse(res);
 
@@ -298,11 +317,12 @@ describe("POST /api/engine/turn — matriks story", () => {
     openMocks.push(mock);
     const user = await registerUser(app, "kek-absen");
     seedConfig(db, user.userId, mock, "sk-live-kek-5555pqrs");
+    const botId = seedBot(db, user.userId);
 
     const prev = process.env.APP_ENCRYPTION_KEY;
     delete process.env.APP_ENCRYPTION_KEY;
     try {
-      const res = await postTurn(app, user.token, { content: "Halo" });
+      const res = await postTurn(app, user.token, { content: "Halo", botId });
       expect(res.status).toBe(200);
       const { events } = await readSse(res);
       expect(names(events)).toEqual(["thread.updated", "error", "turn.settled"]);
@@ -328,10 +348,13 @@ describe("POST /api/engine/turn — matriks story", () => {
     const userB = await registerUser(app, "bravo");
     seedConfig(db, userA.userId, mockA, "sk-live-alpha-aaa1111aaaa");
     seedConfig(db, userB.userId, mockB, "sk-live-bravo-bbb2222bbbb");
+    const botA = seedBot(db, userA.userId, "Bot alpha");
+    const botB = seedBot(db, userB.userId, "Bot bravo");
 
-    // Tanpa threadId → thread auto per pengguna (semantik story 3).
-    const turnA = await postTurn(app, userA.token, { content: "Untuk alpha" });
-    const turnB = await postTurn(app, userB.token, { content: "Untuk bravo" });
+    // Tanpa threadId → thread auto per pengguna untuk bot masing-masing
+    // (semantik story 3 + binding multi-bot).
+    const turnA = await postTurn(app, userA.token, { content: "Untuk alpha", botId: botA });
+    const turnB = await postTurn(app, userB.token, { content: "Untuk bravo", botId: botB });
     const eventsA = await readSse(turnA);
     const eventsB = await readSse(turnB);
 
@@ -402,10 +425,11 @@ describe("POST /api/engine/turn — voice notes (epic-voice story 2)", () => {
     openMocks.push(mock);
     const user = await registerUser(app, "voice-baru");
     seedConfig(db, user.userId, mock, "sk-live-voice-baru-1111aa");
+    const botId = seedBot(db, user.userId);
     const mime = "audio/webm;codecs=opus";
     const audioId = await uploadAudio(app, user.token, 42_000, mime);
 
-    const res = await postTurn(app, user.token, { audioId });
+    const res = await postTurn(app, user.token, { audioId, botId });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/event-stream");
 

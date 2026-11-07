@@ -53,10 +53,34 @@ export const providerConfigs = sqliteTable(
   (table) => [uniqueIndex("provider_configs_user_id_kind_unique").on(table.userId, table.kind)],
 );
 
+// epic-multi-bot (AD-6 revision): `bots` — one bot entity per user (name +
+// persona). Persona is a FULL system-prompt replacement consumed by the engine
+// adapter; an empty persona falls back to DEFAULT_BOT_PERSONA at the engine
+// route, never in the DB. No avatar/appearance column by design (plan Never:
+// no new avatar system). Deleting a bot cascades its threads (and their
+// messages via the threads→messages cascade).
+export const bots = sqliteTable(
+  "bots",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    persona: text("persona").notNull().default(""),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [index("bots_user_id_created_at_index").on(table.userId, table.createdAt)],
+);
+
 // epic-percakapan (R2, AD-5, AD-6): `threads` + `messages` — riwayat percakapan
 // per pengguna. Server adalah penulis tunggal (route giliran, story 3); cerita
 // ini hanya membaca. `threads.title` DEFAULT '' — kolom disiapkan untuk daftar;
 // pengisian judul sungguhan (turunan pesan user pertama) = keputusan story 3.
+// `bot_id` (multi-bot): the bot this thread belongs to — set at thread
+// creation, never edited afterwards. Nullable only because pre-multi-bot rows
+// exist until migration 0005 backfills them; new writes always bind a bot.
 
 export const threads = sqliteTable(
   "threads",
@@ -65,6 +89,7 @@ export const threads = sqliteTable(
     userId: text("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
+    botId: text("bot_id").references(() => bots.id, { onDelete: "cascade" }),
     title: text("title").notNull().default(""),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
@@ -121,6 +146,7 @@ export const audioBlobs = sqliteTable("audio_blobs", {
 export type User = InferSelectModel<typeof users>;
 export type AuthSession = InferSelectModel<typeof authSessions>;
 export type ProviderConfig = InferSelectModel<typeof providerConfigs>;
+export type Bot = InferSelectModel<typeof bots>;
 export type Thread = InferSelectModel<typeof threads>;
 export type Message = InferSelectModel<typeof messages>;
 export type AudioBlob = InferSelectModel<typeof audioBlobs>;

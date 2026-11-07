@@ -211,6 +211,19 @@ async function getConfig(cookie: string, kind: string): Promise<ConfigView> {
   return res.body as ConfigView;
 }
 
+type BotView = { id: string; name: string; persona: string; createdAt: string };
+
+/** Create a bot through the real HTTP route — a thread-creating turn names it. */
+async function createBot(cookie: string, name: string, persona?: string): Promise<BotView> {
+  const res = await requestJson("/api/bots", {
+    method: "POST",
+    headers: { ...JSON_HEADERS, cookie },
+    body: JSON.stringify(persona === undefined ? { name } : { name, persona }),
+  });
+  expect(res.status).toBe(201);
+  return res.body as BotView;
+}
+
 /** readSse bersama (tests/helpers/sse.ts) + rekam raw body untuk audit R2 —
  * helper murni tak tahu perekaman, probe membungkus untuk pencatatan. */
 async function readSseRecorded(res: Response): Promise<{ events: SseEvent[]; raw: string }> {
@@ -355,8 +368,14 @@ describe("probe build tersaji — anak proses produksi lewat HTTP+SSE nyata", ()
     expect(view.maskedHint).toBe("sk-…abcd");
     expect(JSON.stringify(view)).not.toContain(OPENAI_API_KEY);
 
+    // Multi-bot: the thread-creating turn names a bot whose persona is a FULL
+    // system-prompt replacement — the served child must send it to the provider.
+    const probePersona = "You are the served probe bot: answer only in plain sentences.";
+    const bot = await createBot(cookie, "Probe Bot", probePersona);
+
     const { events, raw } = await postTurn(cookie, {
       content: "Giliran uji openai pada proses penyajian",
+      botId: bot.id,
       clientToken: "tok-served-openai",
     });
     assertFullContract(events, {
@@ -372,6 +391,8 @@ describe("probe build tersaji — anak proses produksi lewat HTTP+SSE nyata", ()
     expect(mock.requests[0].authorization).toBe(`Bearer ${OPENAI_API_KEY}`);
     expect(mock.requests[0].url).toBe("/v1/chat/completions");
     expect(mock.requests[0].body).toContain("Giliran uji openai pada proses penyajian");
+    // The bot's replacement persona reached the served-child engine verbatim.
+    expect(mock.requests[0].body).toContain(probePersona);
   }, 60_000);
 
   it("giliran anthropic nyata + R2: x-api-key = kunci yang di-PUT; kunci utuh absen dari semua body + log anak proses", async () => {
@@ -390,9 +411,11 @@ describe("probe build tersaji — anak proses produksi lewat HTTP+SSE nyata", ()
     expect(put.maskedHint).toBe("sk-…wxyz");
     expect(JSON.stringify(put)).not.toContain(ANTHROPIC_API_KEY);
 
+    const bot = await createBot(cookie, "Anthropic Probe Bot");
     const { events, raw } = await postTurn(cookie, {
       kind: "anthropic",
       content: "Giliran uji anthropic pada proses penyajian",
+      botId: bot.id,
       clientToken: "tok-served-anthropic",
     });
     assertFullContract(events, {
@@ -464,9 +487,12 @@ describe("served build — multi-turn over HTTP, two-account isolation, restart 
     expect(anthropicPut.maskedHint).toBe("sk-…wxyz");
 
     // Turn 1 — no threadId: the default kind (openai-compatible) runs and the
-    // server creates the thread; its id comes from the final event.
+    // server creates the thread for the named bot; its id comes from the final
+    // event. Turns 2–3 continue that thread, so they need no botId.
+    const aliceBot = await createBot(aliceCookie, "Alice Bot");
     const turn1 = await postTurn(aliceCookie, {
       content: turn1Content,
+      botId: aliceBot.id,
       clientToken: "tok-mt-one",
     });
     aliceThreadId = threadIdFromEvents(turn1.events);
@@ -743,10 +769,13 @@ describe("served build — voice end-to-end: upload, turn, history, playback, is
     const uploaded = patternBytes(2048, 11);
     aliceAudioId = await uploadAudio(aliceCookie, uploaded, 7000);
 
-    // Voice turn: audioId INSTEAD of content; the server derives the stored
-    // text and the stream still satisfies the full turn contract.
+    // Voice turn: audioId INSTEAD of content, plus the bot a new thread is
+    // created for; the server derives the stored text and the stream still
+    // satisfies the full turn contract.
+    const voiceBot = await createBot(aliceCookie, "Voice Bot");
     const turn = await postTurn(aliceCookie, {
       audioId: aliceAudioId,
+      botId: voiceBot.id,
       clientToken: "tok-served-voice",
     });
     aliceThreadId = threadIdFromEvents(turn.events);
@@ -1056,6 +1085,7 @@ describe("served build — session revocation closes the active SSE turn", () =>
   // State shared by the three tests below (declaration order is the contract).
   let revokeThreadId = "";
   let reLoginCookie = "";
+  let revokeBotId = "";
   let slowMock: MockOpenAI | null = null;
 
   // 215 chars → 18 chunks × 250 ms ≈ 4.5 s of natural streaming. The first
@@ -1091,12 +1121,21 @@ describe("served build — session revocation closes the active SSE turn", () =>
     });
     expect(put.baseUrl).toBe(mock.baseUrl);
 
+    // The thread-creating turn names a bot; the re-login regression turn below
+    // reuses it (bots live in the DB and outlive the revoked session).
+    const bot = await createBot(cookie, "Revoke Bot");
+    revokeBotId = bot.id;
+
     // POST the turn but do NOT await the whole body: frames are consumed
     // incrementally so the session can be revoked while the stream is live.
     const res = await fetch(`${baseUrl}/api/engine/turn`, {
       method: "POST",
       headers: { ...JSON_HEADERS, cookie },
-      body: JSON.stringify({ content: revokeContent, clientToken: "tok-served-revoke" }),
+      body: JSON.stringify({
+        content: revokeContent,
+        botId: bot.id,
+        clientToken: "tok-served-revoke",
+      }),
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/event-stream");
@@ -1214,6 +1253,7 @@ describe("served build — session revocation closes the active SSE turn", () =>
 
   it("normal turn on the same path: full thread.updated → delta → final → settled contract", async () => {
     if (reLoginCookie === "") throw new Error("re-login cookie missing — test order broken");
+    if (revokeBotId === "") throw new Error("revoke bot missing — test order broken");
 
     // Second, FAST mock: chunkDelayMs is bound to the mock instance, so the
     // regression needs its own instance; the PUT overwrites the stored
@@ -1229,6 +1269,7 @@ describe("served build — session revocation closes the active SSE turn", () =>
 
     const turn = await postTurn(reLoginCookie, {
       content: "Served revocation regression marker d93k",
+      botId: revokeBotId,
       clientToken: "tok-served-revoke-regression",
     });
     assertFullContract(turn.events, {
@@ -1293,8 +1334,11 @@ describe("served build — final integrated verification: at-rest ciphertext, cr
     // A FULL turn proves the decrypt path really ran in the child: the stream
     // satisfies the complete event contract and the mock saw the PUT key on
     // the wire (decryption happened server-side before the provider call).
+    // Like every thread-creating turn, it names a bot.
+    const atRestBot = await createBot(aliceCookie, "At-Rest Bot");
     const turn = await postTurn(aliceCookie, {
       content: "Served final verification marker 7k2q",
+      botId: atRestBot.id,
       clientToken: "tok-served-final",
     });
     assertFullContract(turn.events, {

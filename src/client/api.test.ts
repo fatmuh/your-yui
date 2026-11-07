@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  createBot,
+  deleteBot,
   deleteProviderConfig,
   fetchMe,
   fetchThreadMessages,
   getProviderConfig,
+  listBots,
   listThreads,
   loginUser,
   logoutUser,
@@ -523,6 +526,111 @@ describe("resolveActiveKind", () => {
 
 const AUDIO_ID = "01JCAUDIOAUDIOAUDIOAUDIOAU01";
 
+const BOT_DTO = {
+  id: "01JCBOTBOTBOTBOTBOTBOTBOT01",
+  name: "Chef",
+  persona: "You are a laconic chef.",
+  createdAt: "2026-11-07T09:00:00.000Z",
+};
+
+describe("listBots", () => {
+  it("calls GET /api/bots and returns the BotDto array unchanged (creation order)", async () => {
+    const mock = stubFetch(jsonResponse([BOT_DTO]));
+
+    await expect(listBots()).resolves.toEqual([BOT_DTO]);
+    // GET without init — the session cookie rides the same-origin default.
+    expect(mock).toHaveBeenCalledWith("/api/bots");
+  });
+
+  it("401 envelope → ApiError unauthorized", async () => {
+    stubFetch(
+      jsonResponse(
+        { error: { code: "unauthorized", message: "A valid session is required." } },
+        401,
+      ),
+    );
+
+    await expect(listBots()).rejects.toMatchObject({
+      name: "ApiError",
+      code: "unauthorized",
+      message: "A valid session is required.",
+    });
+  });
+});
+
+describe("createBot", () => {
+  it("posts {name,persona} to /api/bots and returns the 201 BotDto", async () => {
+    const mock = stubFetch(jsonResponse(BOT_DTO, 201));
+
+    const created = await createBot({ name: "Chef", persona: BOT_DTO.persona });
+
+    expect(created).toEqual(BOT_DTO);
+    const [url, init] = firstCall(mock);
+    expect(url).toBe("/api/bots");
+    expect(init.method).toBe("POST");
+    expect(init.headers).toMatchObject({ "content-type": "application/json" });
+    expect(JSON.parse(String(init.body))).toEqual({
+      name: "Chef",
+      persona: BOT_DTO.persona,
+    });
+  });
+
+  it("omits the persona key entirely when the caller provides none", async () => {
+    const mock = stubFetch(jsonResponse({ ...BOT_DTO, persona: "" }, 201));
+
+    await createBot({ name: "Chef" });
+
+    const [, init] = firstCall(mock);
+    // The server treats an absent persona as "default persona at prompt time";
+    // the body never carries persona: null/"".
+    expect(JSON.parse(String(init.body))).toStrictEqual({ name: "Chef" });
+  });
+
+  it("400 invalid_request envelope (empty name) → ApiError with the server message", async () => {
+    stubFetch(
+      jsonResponse(
+        {
+          error: {
+            code: "invalid_request",
+            message: '"name" must be a non-empty string of at most 64 characters.',
+          },
+        },
+        400,
+      ),
+    );
+
+    await expect(createBot({ name: "   " })).rejects.toMatchObject({
+      name: "ApiError",
+      code: "invalid_request",
+      message: '"name" must be a non-empty string of at most 64 characters.',
+    });
+  });
+});
+
+describe("deleteBot", () => {
+  it("sends DELETE /api/bots/:id and resolves on 204 (server cascades the threads)", async () => {
+    const mock = stubFetch(new Response(null, { status: 204 }));
+
+    await expect(deleteBot(BOT_DTO.id)).resolves.toBeUndefined();
+
+    const [url, init] = firstCall(mock);
+    expect(url).toBe(`/api/bots/${BOT_DTO.id}`);
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("404 envelope for a foreign or unknown bot → ApiError not_found", async () => {
+    stubFetch(
+      jsonResponse({ error: { code: "not_found", message: "Bot not found." } }, 404),
+    );
+
+    await expect(deleteBot(BOT_DTO.id)).rejects.toMatchObject({
+      name: "ApiError",
+      code: "not_found",
+      message: "Bot not found.",
+    });
+  });
+});
+
 describe("uploadAudioNote", () => {
   it("posts multipart FormData (audio file + durationMs) to /api/audio and returns the stored view", async () => {
     const mock = stubFetch(
@@ -668,6 +776,35 @@ describe("streamTurn", () => {
 
     const [, init] = firstCall(mock);
     expect(JSON.parse(String(init.body))).toStrictEqual({
+      content: "Next turn",
+      threadId: THREAD_A,
+    });
+  });
+
+  it("sends botId for a new-thread turn and drops the key when it resolves undefined", async () => {
+    const mock = stubFetch(sseResponse([sseFrame("turn.settled", { threadId: THREAD_A })]));
+
+    await streamTurn(
+      // Mirrors the production call for a bot placeholder conversation: the
+      // thread does not exist yet, so the turn names the bot instead.
+      { content: "Hello", threadId: undefined, botId: BOT_DTO.id },
+      () => undefined,
+    );
+
+    const [, init] = firstCall(mock);
+    expect(JSON.parse(String(init.body))).toStrictEqual({
+      content: "Hello",
+      botId: BOT_DTO.id,
+    });
+
+    const dropped = stubFetch(sseResponse([sseFrame("turn.settled", { threadId: THREAD_A })]));
+    // Mirrors the production call for a server conversation: the thread's own
+    // bot governs, so botId resolves undefined — the serializer must drop the
+    // key (a "botId": null would be a guaranteed 400 server-side).
+    const resolved: string | undefined = undefined;
+    await streamTurn({ content: "Next turn", threadId: THREAD_A, botId: resolved }, () => undefined);
+    const [, secondInit] = firstCall(dropped);
+    expect(JSON.parse(String(secondInit.body))).toStrictEqual({
       content: "Next turn",
       threadId: THREAD_A,
     });

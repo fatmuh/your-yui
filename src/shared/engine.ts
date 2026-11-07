@@ -46,6 +46,12 @@ export type EngineSession = {
 export type EnginePromptInput = {
   sessionId: string;
   content: TurnContent;
+  /**
+   * System prompt FULL-REPLACEMENT for this turn (AD-1 revision): the bot's
+   * persona, already fallback-resolved by the route (never empty here) — the
+   * engine's default coding-agent prompt is fully replaced, never appended.
+   */
+  persona: string;
   /** Token dari POST klien; dibawa balik di `message.final` untuk dedup pesan optimistik. */
   clientToken?: string;
 };

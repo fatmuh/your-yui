@@ -8,6 +8,7 @@ import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
 import { providerConfigs } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
+import { insertBot } from "../bots/store.ts";
 import { maskSecret } from "./crypto.ts";
 import { registerUser } from "../../../tests/helpers/api.ts";
 import { readSse } from "../../../tests/helpers/sse.ts";
@@ -190,7 +191,7 @@ describe("GET /api/provider-configs/:kind", () => {
 
 describe("DELETE /api/provider-configs/:kind", () => {
   it("hapus: 204 tanpa body; GET berikut 404; giliran berikut no_provider_config; kedua 404", async () => {
-    const { app } = makeApp();
+    const { app, db } = makeApp();
     const user = await registerUser(app, "hapus-config");
     expect(
       (await call(app, "PUT", "openai-compatible", user.token, OPENAI_BODY)).status,
@@ -203,9 +204,11 @@ describe("DELETE /api/provider-configs/:kind", () => {
     expect((await call(app, "GET", "openai-compatible", user.token)).status).toBe(404);
 
     // Giliran berikutnya: engine tak lagi menemukan config → no_provider_config.
+    // Giliran tanpa threadId wajib menamai bot-nya (multi-bot harness).
+    const botId = insertBot(db, user.userId, { name: "Bot uji", persona: "" }).id;
     const turn = await app.request("/api/engine/turn", {
       method: "POST",
-      body: JSON.stringify({ content: "Halo" }),
+      body: JSON.stringify({ content: "Halo", botId }),
       headers: {
         "content-type": "application/json",
         cookie: `${SESSION_COOKIE}=${user.token}`,

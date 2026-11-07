@@ -278,6 +278,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .panel-empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; padding: 24px 4px; color: var(--text-muted); }
 .panel-empty p { color: #ededed; font-weight: 500; }
 .panel-empty > span { font-size: 0.8125rem; }
+.bots-empty { max-width: 40ch; }
+.bots-empty > span { line-height: 1.6; }
+.bots-empty-cta { min-height: 36px; padding: 6px 16px; border-radius: 999px; background: var(--control-primary-bg); color: var(--control-primary-text); font-weight: 600; }
+.bots-empty-area { display: flex; align-items: center; justify-content: center; }
 .panel-file-list { display: flex; flex-direction: column; gap: 8px; }
 .panel-file-list li { display: flex; align-items: flex-start; gap: 8px; border-radius: 10px; padding: 10px; background: #202020; }
 .panel-file-list svg { flex-shrink: 0; margin-block-start: 2px; }

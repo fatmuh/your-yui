@@ -4,11 +4,15 @@ import { BellDot, Copy, EyeOff, FolderPlus, Pin, SquarePen, Trash2 } from 'lucid
 
 export type ChatAction = 'pin' | 'section' | 'unread' | 'rename' | 'copy' | 'hide' | 'delete'
 export type ChatMenuTarget = { id: string; title: string; pinned?: boolean; unread?: boolean; x: number; y: number; trigger: HTMLElement }
+export type ChatMenuItem = { id: ChatAction; label: string; icon: typeof Pin; separator?: boolean }
 
-export function ChatContextMenu({ target, onClose, onAction }: { target: ChatMenuTarget; onClose: () => void; onAction: (action: ChatAction) => void }) {
+export function ChatContextMenu({ target, onClose, onAction, items }: { target: ChatMenuTarget; onClose: () => void; onAction: (action: ChatAction) => void; items?: ChatMenuItem[] }) {
   const ref = useRef<HTMLDivElement>(null)
   const closing = useRef(false)
-  const actions = [
+  // The default set is the template's full action list; callers with a
+  // narrower model (e.g. server-backed bots: copy + delete only) pass their
+  // own items. Every id still flows through the same onAction channel.
+  const actions: readonly ChatMenuItem[] = items ?? [
     { id: 'pin', label: target.pinned ? 'Unpin' : 'Pin', icon: Pin },
     { id: 'section', label: 'Move to new section', icon: FolderPlus },
     { id: 'unread', label: target.unread ? 'Mark as Read' : 'Mark as Unread', icon: BellDot },
@@ -16,7 +20,7 @@ export function ChatContextMenu({ target, onClose, onAction }: { target: ChatMen
     { id: 'copy', label: 'Copy conversation ID', icon: Copy, separator: true },
     { id: 'hide', label: 'Hide from sidebar', icon: EyeOff, separator: true },
     { id: 'delete', label: 'Delete', icon: Trash2 },
-  ] as const
+  ]
 
   async function close(action?: ChatAction, restore = true) {
     const menu = ref.current

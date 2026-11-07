@@ -33,6 +33,7 @@ function errorResponse(
 function toThreadDto(row: Thread): ThreadDto {
   return {
     id: row.id,
+    botId: row.botId,
     title: row.title,
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),

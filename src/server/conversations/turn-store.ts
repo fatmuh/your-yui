@@ -2,6 +2,7 @@ import { and, desc, eq, max } from "drizzle-orm";
 import { monotonicFactory } from "ulidx";
 import { messages, threads, type Message, type Thread } from "../db/schema.ts";
 import type { YuiDatabase } from "../db/index.ts";
+import { getBotById } from "../bots/store.ts";
 
 // Penulis giliran (story 3, AD-5, AD-6): route engine memanggil helper
 // murni-DB ini — modul conversations TIDAK mengimpor engine (AD-1); alur/
@@ -111,21 +112,32 @@ export type CreatedThread = {
   updatedAt: number;
 };
 
-/** Thread baru (ULID server, judul turunan) + pesan user pertamanya. */
+/**
+ * Thread baru (ULID server, judul turunan) + pesan user pertamanya, terikat
+ * bot `botId` milik `userId`. Null bila bot tak ada ATAU milik orang lain —
+ * route memetakan null → 404 identik (anti-enumeration) TANPA menulis apa pun
+ * (multi-bot harness: thread lahir terikat bot; binding tak pernah berubah).
+ */
 export function createThreadWithMessage(
   db: YuiDatabase,
   userId: string,
+  botId: string,
   content: string,
   at: number,
   audioId?: string,
-): CreatedThread {
+): CreatedThread | null {
+  if (getBotById(db, userId, botId) === null) {
+    return null;
+  }
   const threadId = newUlid();
   const title = deriveTitle(content);
   // Brand-new thread: nothing exists yet, so the clock has nothing to
   // regress against — but the thread row and its first message still share
   // one value straight from the same monotonic helper.
   const writeAt = monotonicThreadTime(db, userId, threadId, at);
-  db.insert(threads).values({ id: threadId, userId, title, createdAt: writeAt, updatedAt: writeAt }).run();
+  db.insert(threads)
+    .values({ id: threadId, userId, botId, title, createdAt: writeAt, updatedAt: writeAt })
+    .run();
   db.insert(messages)
     .values({
       id: newUlid(),

@@ -6,6 +6,7 @@
 // mentah, sehingga AuthPage menampilkan pesan bersih tanpa dump JSON.
 
 import type {
+  BotDto,
   MessageDto,
   ProviderConfigDto,
   ThreadDto,
@@ -223,15 +224,56 @@ export async function uploadAudioNote(
 }
 
 /**
- * Body for POST /api/engine/turn — omit `threadId` to start a new thread.
- * Exactly one of `content` (text) or `audioId` (an uploaded voice note) is
- * sent: the server enforces the XOR, so this client always sends one and
- * never both.
+ * GET /api/bots — the session user's bots, oldest first (BotDto[]). A user
+ * without bots gets [] — the empty state, not an error.
+ */
+export async function listBots(): Promise<BotDto[]> {
+  const response = await fetch("/api/bots");
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as BotDto[];
+}
+
+/** Body for POST /api/bots; an omitted/empty `persona` means the default one. */
+export type CreateBotInput = {
+  name: string;
+  persona?: string;
+};
+
+/**
+ * POST /api/bots — create one bot for the session user → 201 BotDto. A name
+ * that is empty or over 64 characters (or a persona over 8,000) rejects with
+ * ApiError `invalid_request`.
+ */
+export async function createBot(input: CreateBotInput): Promise<BotDto> {
+  const response = await postJson("/api/bots", input);
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as BotDto;
+}
+
+/**
+ * DELETE /api/bots/:id — 204; the bot's threads and their messages cascade
+ * server-side. A foreign or unknown id rejects with ApiError `not_found`
+ * (identical envelope, anti-enumeration).
+ */
+export async function deleteBot(id: string): Promise<void> {
+  const response = await fetch(`/api/bots/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) throw await toApiError(response);
+}
+
+/**
+ * Body for POST /api/engine/turn — omit `threadId` to start a new thread,
+ * in which case `botId` is REQUIRED (the server 400s without it and 404s on
+ * a bot that is not the session user's). Exactly one of `content` (text) or
+ * `audioId` (an uploaded voice note) is sent: the server enforces the XOR,
+ * so this client always sends one and never both.
  */
 export type StreamTurnInput = {
   content?: string;
   audioId?: string;
   threadId?: string;
+  botId?: string;
   clientToken?: string;
   /** Provider kind for this turn; omitted lets the server default apply. */
   kind?: ProviderKind;

@@ -5,6 +5,8 @@ import type { YuiDatabase } from "../db/index.ts";
 import { sessionUser } from "../auth/service.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { getProviderConfig } from "../providers/store.ts";
+import { getBotById, resolveBotPersona } from "../bots/store.ts";
+import { DEFAULT_BOT_PERSONA } from "../../shared/app.ts";
 import {
   appendAssistantMessage,
   appendUserMessage,
@@ -156,6 +158,35 @@ export function engineRoutes(db: YuiDatabase): Hono {
       );
     }
 
+    // Multi-bot harness: a turn is bound to a bot. `botId` is REQUIRED when
+    // `threadId` is absent (the new thread is created for that bot); when a
+    // thread is given, the thread's OWN bot governs the turn and a mismatching
+    // `botId` is a 400 (never a silent persona switch). Shape checks stay
+    // pre-stream 400s; ownership is resolved below BEFORE any write.
+    const rawBotId = body?.botId;
+    if (rawBotId !== undefined && (typeof rawBotId !== "string" || rawBotId.length === 0)) {
+      return c.json(
+        {
+          error: {
+            code: "invalid_request",
+            message: `Request body "botId" must be a non-empty string of one of your bots, or omitted when "threadId" is given.`,
+          },
+        },
+        400,
+      );
+    }
+    if (rawThreadId === undefined && typeof rawBotId !== "string") {
+      return c.json(
+        {
+          error: {
+            code: "invalid_request",
+            message: `Request body "botId" is required when "threadId" is omitted — a new thread must name the bot it belongs to.`,
+          },
+        },
+        400,
+      );
+    }
+
     // kind opsional (default openai-compatible) — nilai di luar union ditolak
     // pra-stream dengan envelope konvensi.
     const rawKind = body?.kind;
@@ -185,17 +216,43 @@ export function engineRoutes(db: YuiDatabase): Hono {
 
     // Tulis giliran (AD-5) — SETELAH seluruh validasi pra-stream: (1) pesan
     // user masuk DB lebih dulu; thread baru (ULID server) membawa judul
-    // turunan pesan pertamanya. Giliran gagal sekalipun, pesan user tetap
-    // (jujur secara transkrip).
+    // turunan pesan pertamanya dan terikat bot pengirim. Giliran gagal
+    // sekalipun, pesan user tetap (jujur secara transkrip).
     const turnStartedAt = Date.now();
     let threadId: string;
     let newThreadTitle: string | undefined;
     let userWriteAt: number;
+    // Persona giliran ini (fallback resolved — never empty): the bot a new
+    // thread is created for, or the bot the existing thread is bound to.
+    let persona: string;
     if (rawThreadId === undefined) {
-      const created = createThreadWithMessage(db, user.id, userText, turnStartedAt, userAudioId);
+      // Owner-scoped resolution BEFORE any write: foreign and unknown bot ids
+      // share one identical 404 (anti-enumeration), leaving nothing behind.
+      const bot = getBotById(db, user.id, rawBotId as string);
+      if (bot === null) {
+        return c.json(
+          { error: { code: "not_found", message: "Bot not found." } },
+          404,
+        );
+      }
+      const created = createThreadWithMessage(
+        db,
+        user.id,
+        bot.id,
+        userText,
+        turnStartedAt,
+        userAudioId,
+      );
+      if (created === null) {
+        return c.json(
+          { error: { code: "not_found", message: "Bot not found." } },
+          404,
+        );
+      }
       threadId = created.threadId;
       newThreadTitle = created.title;
       userWriteAt = created.updatedAt;
+      persona = resolveBotPersona(bot);
     } else {
       const thread = resolveThread(db, user.id, rawThreadId);
       if (thread === null) {
@@ -204,7 +261,24 @@ export function engineRoutes(db: YuiDatabase): Hono {
           404,
         );
       }
+      // The thread's own bot governs an existing-thread turn; a body botId
+      // that disagrees is rejected instead of silently switching persona.
+      if (rawBotId !== undefined && rawBotId !== thread.botId) {
+        return c.json(
+          {
+            error: {
+              code: "invalid_request",
+              message: `Request body "botId" does not match the bot this thread belongs to; omit it to continue the thread as-is.`,
+            },
+          },
+          400,
+        );
+      }
       threadId = thread.id;
+      // Defensive: threads predating the bots migration carry null bot_id —
+      // the default persona keeps such rows chat-able instead of failing hard.
+      const bot = thread.botId === null ? null : getBotById(db, user.id, thread.botId);
+      persona = bot === null ? DEFAULT_BOT_PERSONA : resolveBotPersona(bot);
       userWriteAt = appendUserMessage(db, user.id, threadId, userText, turnStartedAt, userAudioId).updatedAt;
     }
 
@@ -302,7 +376,7 @@ export function engineRoutes(db: YuiDatabase): Hono {
       };
 
       try {
-        await adapter.prompt({ sessionId, content: transcript, clientToken }, onEvent);
+        await adapter.prompt({ sessionId, content: transcript, persona, clientToken }, onEvent);
       } catch (error) {
         // Defensive: error di luar jaminan adapter tetap berakhir settled
         // (AD-4). Pesan user tetap tersimpan; pesan asisten tidak dibuat.

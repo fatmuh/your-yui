@@ -3,7 +3,10 @@ import type { ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App, { SessionGate } from "./App.tsx";
 import AuthPage from "./AuthPage.tsx";
+import { CreateBotDialog } from "./CreateBotDialog.tsx";
+import { BotsEmptyState } from "./TemplateApp.tsx";
 import { SessionContext, type SessionState } from "./SessionContext.tsx";
+import { DEFAULT_BOT_PERSONA } from "../shared/app.ts";
 
 // Uji komponen gerbang sesi tanpa deps test baru: renderToStaticMarkup + stub
 // nilai SessionContext (efek tidak pernah berjalan di static markup, jadi
@@ -68,9 +71,47 @@ describe("gerbang sesi (SessionGate)", () => {
     );
 
     expect(html).toContain("Connect apps");
-    expect(html).toContain("CFO");
+    // Multi-bot harness: the demo seed bots are GONE — chat starts empty until
+    // the user creates bots. The static (pre-effect) render is the loading
+    // pane: no seed names, and the empty state only appears after the mount
+    // fetch settles (never flashes for a user who HAS bots).
+    expect(html).not.toContain("CFO");
+    expect(html).not.toContain("Create your first bot");
     expect(html).not.toContain("Sign in to Yui");
     expect(html).not.toContain("Loading…");
+  });
+});
+
+// Multi-bot harness: the two pieces of UI a signed-in user meets first — the
+// "no bots yet" empty state and the create dialog whose persona textarea
+// prefills DEFAULT_BOT_PERSONA (so "just a name" still yields a personal
+// assistant). Static markup is enough: both are plain render output.
+describe("BotsEmptyState", () => {
+  it("renders the create-your-first-bot empty state with a create action", () => {
+    const html = renderToStaticMarkup(<BotsEmptyState onCreate={() => undefined} />);
+
+    expect(html).toContain("Create your first bot");
+    expect(html).toContain("Create a bot");
+    expect(html).toContain("bots-empty-cta");
+    // panel-empty pattern: the same class family the other empty states use.
+    expect(html).toContain("panel-empty");
+  });
+});
+
+describe("CreateBotDialog", () => {
+  it("prefills the persona textarea with DEFAULT_BOT_PERSONA and caps name/persona inputs", () => {
+    const html = renderToStaticMarkup(
+      <CreateBotDialog onClose={() => undefined} onCreated={() => undefined} />,
+    );
+
+    expect(html).toContain("Create New Bot");
+    // The persona input starts at the default personal-assistant persona —
+    // the full-replacement system prompt the bot will run.
+    expect(html).toContain(DEFAULT_BOT_PERSONA);
+    expect(html).toMatch(/maxLength="64"/);
+    expect(html).toMatch(/maxLength="8000"/);
+    // Create is disabled until a name is typed (initial state: empty name).
+    expect(html).toMatch(/<button[^>]*class="bot-create"[^>]*disabled/);
   });
 });
 

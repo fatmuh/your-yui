@@ -9,6 +9,7 @@ import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.t
 import { audioBlobs, messages } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { voiceNotePlaceholder } from "../audio/store.ts";
+import { insertBot } from "../bots/store.ts";
 import { createThreadWithMessage } from "./turn-store.ts";
 import { ORPHAN_AUDIO_GRACE_MS, sweepOrphanAudioBlobs } from "./audio-gc.ts";
 import { registerUser } from "../../../tests/helpers/api.ts";
@@ -71,8 +72,18 @@ describe("sweepOrphanAudioBlobs", () => {
     const attached = seedBlob(db, user.userId, now - twentyFiveHours, 128);
 
     // Attach `attached` through the turn-store writer — the same path a voice
-    // turn takes: placeholder text + blob reference on the user message.
-    createThreadWithMessage(db, user.userId, voiceNotePlaceholder(42_000), now - twentyFiveHours, attached);
+    // turn takes: placeholder text + blob reference on the user message. The
+    // writer requires the thread's owning bot (multi-bot harness binding).
+    const bot = insertBot(db, user.userId, { name: "GC Bot", persona: "" });
+    const created = createThreadWithMessage(
+      db,
+      user.userId,
+      bot.id,
+      voiceNotePlaceholder(42_000),
+      now - twentyFiveHours,
+      attached,
+    );
+    expect(created).not.toBeNull();
 
     expect(sweepOrphanAudioBlobs(db, now)).toBe(1);
     // The old orphan is the one row that disappeared.

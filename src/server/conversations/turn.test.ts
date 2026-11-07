@@ -10,6 +10,7 @@ import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
 import { messages, threads } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
+import { insertBot } from "../bots/store.ts";
 import { upsertProviderConfig } from "../providers/store.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../../tests/helpers/mock-openai.ts";
 import { postTurn, registerUser } from "../../../tests/helpers/api.ts";
@@ -97,6 +98,11 @@ function seedThread(db: YuiDatabase, userId: string): string {
   return threadId;
 }
 
+/** Bot milik sesi — giliran tanpa threadId kini wajib menamai bot-nya. */
+function seedBot(db: YuiDatabase, userId: string, name = "Bot uji", persona = ""): string {
+  return insertBot(db, userId, { name, persona }).id;
+}
+
 function seedMessage(
   db: YuiDatabase,
   threadId: string,
@@ -140,11 +146,17 @@ describe("dua giliran satu thread (konteks multi-giliran server-side)", () => {
     openMocks.push(mock);
     const user = await registerUser(app, "dua-giliran");
     seedConfig(db, user.userId, mock, "sk-live-dua-11112222aaaa");
+    // Bot ber-persona kustom: giliran baru wajib menamai bot-nya, dan persona
+    // bot (pengganti penuh) harus sampai ke penyedia.
+    const persona = "You are a weekend trip planner; you only discuss short getaways.";
+    const botId = seedBot(db, user.userId, "Travel", persona);
 
-    // Giliran 1 — threadId ABSENT: server membuat thread (ULID server).
+    // Giliran 1 — threadId ABSENT: server membuat thread (ULID server) untuk
+    // bot yang dinamai botId.
     const first = await readSse(
       await postTurn(app, user.token, {
         content: "Pertanyaan giliran pertama",
+        botId,
         clientToken: "tok-giliran-1",
       }),
     );
@@ -187,6 +199,10 @@ describe("dua giliran satu thread (konteks multi-giliran server-side)", () => {
     expect(mock.requests[1]!.body).toContain("user: Pertanyaan giliran pertama");
     expect(mock.requests[1]!.body).toContain(`assistant: ${reply}`);
     expect(mock.requests[1]!.body).toContain("user: Pertanyaan giliran kedua");
+    // Persona pengganti penuh sampai ke penyedia di KEDUA giliran (thread baru
+    // membawa bot-nya; giliran lanjutan memakai bot thread itu juga).
+    expect(mock.requests[0]!.body).toContain(persona);
+    expect(mock.requests[1]!.body).toContain(persona);
 
     // Riwayat GET: 4 pesan urut asc, teks persis.
     const history = await getThreadMessages(app, user.token, threadId);
@@ -207,19 +223,22 @@ describe("dua giliran satu thread (konteks multi-giliran server-side)", () => {
 
 describe("thread auto-create berjudul turunan", () => {
   it("judul = awal pesan user pertama, whitespace diratakan, cap 80 char; terlihat di GET /api/threads dan event", async () => {
-    const { app } = makeApp();
+    const { app, db } = makeApp();
     const user = await registerUser(app, "judul-turunan");
+    const botId = seedBot(db, user.userId);
 
     // Giliran tanpa config pun giliran sungguhan: pesan user + thread tetap
     // tersimpan (jujur secara transkrip) — cukup membuktikan judul.
     const messy = await readSse(
       await postTurn(app, user.token, {
         content: "   Rencana \n\n hari   Sabtu — \tbersih-bersih  ",
+        botId,
       }),
     );
     const long = await readSse(
       await postTurn(app, user.token, {
         content: `Awalan judul ${"kata-turunan ".repeat(40)}`,
+        botId,
       }),
     );
 
@@ -280,9 +299,10 @@ describe("provider error mid-giliran", () => {
     openMocks.push(failing);
     const user = await registerUser(app, "gagal-tersimpan");
     seedConfig(db, user.userId, failing, "sk-live-gagal-tersimpan-1a2b");
+    const botId = seedBot(db, user.userId);
 
     const { events } = await readSse(
-      await postTurn(app, user.token, { content: "Tanya yang gagal" }),
+      await postTurn(app, user.token, { content: "Tanya yang gagal", botId }),
     );
     expect(names(events)).toEqual(["thread.updated", "error", "turn.settled"]);
     expect(events[1]!.data.code).toBe("provider_error");
@@ -305,10 +325,12 @@ describe("persist final", () => {
     openMocks.push(mock);
     const user = await registerUser(app, "final-tersimpan");
     seedConfig(db, user.userId, mock, "sk-live-final-33334444bbbb");
+    const botId = seedBot(db, user.userId);
 
     const { events } = await readSse(
       await postTurn(app, user.token, {
         content: "Pertanyaan final",
+        botId,
         clientToken: "tok-final-1",
       }),
     );
@@ -339,9 +361,10 @@ describe("padanan restart", () => {
     openMocks.push(mock);
     const user = await registerUser(first.app, "pra-restart");
     seedConfig(first.db, user.userId, mock, "sk-live-restart-55556666cccc");
+    const botId = seedBot(first.db, user.userId);
 
     const turn = await readSse(
-      await postTurn(first.app, user.token, { content: "Sebelum restart" }),
+      await postTurn(first.app, user.token, { content: "Sebelum restart", botId }),
     );
     const threadId = String(turn.events[0]!.data.threadId);
     const before = await getThreadMessages(first.app, user.token, threadId);
@@ -432,12 +455,13 @@ describe("penulis turn-store (unit)", () => {
   it("ULID monotonic: dua createThreadWithMessage beruntun (kemungkinan sama-ms) tetap naik leksikografis", async () => {
     const { app, db } = makeApp();
     const user = await registerUser(app, "ulid-monoton");
+    const botId = seedBot(db, user.userId);
 
     // `ulid()` default acak dalam ms yang sama — pabrik monotonic turn-store
     // wajib menjaga arah, atau tiebreaker (createdAt, id) bisa membalik
     // pasangan user→asisten sama-ms.
-    const first = createThreadWithMessage(db, user.userId, "Pertanyaan pertama", Date.now());
-    const second = createThreadWithMessage(db, user.userId, "Pertanyaan kedua", Date.now());
+    const first = createThreadWithMessage(db, user.userId, botId, "Pertanyaan pertama", Date.now())!;
+    const second = createThreadWithMessage(db, user.userId, botId, "Pertanyaan kedua", Date.now())!;
 
     expect(first.threadId).not.toBe(second.threadId);
     expect(first.threadId < second.threadId).toBe(true);
@@ -446,12 +470,13 @@ describe("penulis turn-store (unit)", () => {
   it("judul dipotong per code point: emoji di perbatasan 80 tetap utuh (tanpa lone surrogate)", async () => {
     const { app, db } = makeApp();
     const user = await registerUser(app, "judul-emoji");
+    const botId = seedBot(db, user.userId);
 
     // Unit UTF-16 ke-80/81 jatuh di TENGAH emoji pertama — potongan per code
     // point harus menyimpan emoji utuh, bukan belahan high-surrogate.
     const emoji = "\u{1F642}"; // 🙂
     const content = `${"a".repeat(79)}${emoji.repeat(3)}`;
-    const { title } = createThreadWithMessage(db, user.userId, content, Date.now());
+    const { title } = createThreadWithMessage(db, user.userId, botId, content, Date.now())!;
 
     expect(title).toBe(`${"a".repeat(79)}${emoji}`);
     expect([...title]).toHaveLength(80);
@@ -468,7 +493,8 @@ describe("per-thread logical clock (unit)", () => {
     const { app, db } = makeApp();
     const user = await registerUser(app, "clock-regressed-append");
     const base = Date.now();
-    const threadId = createThreadWithMessage(db, user.userId, "pertanyaan awal", base).threadId;
+    const botId = seedBot(db, user.userId);
+    const threadId = createThreadWithMessage(db, user.userId, botId, "pertanyaan awal", base)!.threadId;
     appendAssistantMessage(db, user.userId, threadId, "jawaban awal", base + 10);
 
     // Wall clock steps 5s backwards between writes.
@@ -483,7 +509,8 @@ describe("per-thread logical clock (unit)", () => {
     const { app, db } = makeApp();
     const user = await registerUser(app, "clock-window");
     const base = Date.now();
-    const threadId = createThreadWithMessage(db, user.userId, "pesan-00", base).threadId;
+    const botId = seedBot(db, user.userId);
+    const threadId = createThreadWithMessage(db, user.userId, botId, "pesan-00", base)!.threadId;
     let clock = base;
     for (let i = 1; i < 25; i += 1) {
       // NTP-style regression every few writes; the newest message (i=24)
@@ -508,7 +535,8 @@ describe("per-thread logical clock (unit)", () => {
     const { app, db } = makeApp();
     const user = await registerUser(app, "clock-asc-order");
     const base = Date.now();
-    const threadId = createThreadWithMessage(db, user.userId, "pesan-00", base).threadId;
+    const botId = seedBot(db, user.userId);
+    const threadId = createThreadWithMessage(db, user.userId, botId, "pesan-00", base)!.threadId;
     let clock = base;
     for (let i = 1; i < 12; i += 1) {
       clock += i % 3 === 0 ? -1_000 : 5;
@@ -539,7 +567,8 @@ describe("per-thread logical clock (unit)", () => {
     const { app, db } = makeApp();
     const user = await registerUser(app, "clock-updatedat");
     const base = Date.now();
-    const created = createThreadWithMessage(db, user.userId, "pertanyaan", base);
+    const botId = seedBot(db, user.userId);
+    const created = createThreadWithMessage(db, user.userId, botId, "pertanyaan", base)!;
     const before = resolveThread(db, user.userId, created.threadId)!.updatedAt;
     expect(created.updatedAt).toBe(before);
 

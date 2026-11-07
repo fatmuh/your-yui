@@ -143,8 +143,11 @@ describe("GET /api/threads", () => {
     expect(bodyA.map((thread) => thread.id)).toEqual([newThread, oldThread]);
     expect(bodyA.map((thread) => thread.id)).not.toContain(threadB);
     // DTO persis: konversi epoch-ms → ISO-8601 UTC terjadi di tepi route.
+    // botId null = kolom 0005 pada fixture pra-migrasi (baris baru selalu
+    // terikat bot lewat route giliran).
     expect(bodyA[0]).toEqual({
       id: newThread,
+      botId: null,
       title: "",
       createdAt: new Date(base + 2_000).toISOString(),
       updatedAt: new Date(base + 3_000).toISOString(),

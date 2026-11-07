@@ -53,13 +53,42 @@ export type ProviderConfigDto = {
 export type MessageRole = "user" | "assistant";
 
 /**
+ * Bot DTO on the API wire (AD-8): GET /api/bots returns BotDto[] (createdAt
+ * asc — creation order, the shortcut-row order), POST /api/bots returns one.
+ * `persona` is the full system-prompt replacement for the bot's turns; an
+ * empty persona means "use DEFAULT_BOT_PERSONA" (resolved at the engine edge,
+ * never stored expanded). No edit endpoint exists in v1 — bots are immutable
+ * after creation.
+ */
+export type BotDto = {
+  id: string;
+  name: string;
+  persona: string;
+  /** ISO-8601 UTC (DB stores epoch-ms; converted at the edge). */
+  createdAt: string;
+};
+
+/**
+ * Fallback persona for bots stored with an empty persona (plan Design Notes,
+ * verbatim — English, frozen): the bot behaves as a general personal
+ * assistant instead of the engine's default coding-agent prompt. The migration
+ * backfill (0005) embeds the same text for pre-multi-bot threads.
+ */
+export const DEFAULT_BOT_PERSONA =
+  "You are a personal assistant. Help with everyday tasks: answering questions, planning, drafting, summarizing, research, and casual conversation. Be warm, direct, and concise. You are not a coding agent — do not assume software tasks unless explicitly asked.";
+
+/**
  * Thread DTO on the API wire (AD-8): GET /api/threads returns ThreadDto[]
  * (updatedAt desc). `title` defaults to '' until story 3 (server-side writer)
- * derives it from the first user message.
+ * derives it from the first user message. `title` is internal (future search);
+ * the client displays the BOT name, never this title.
+ * `botId` is the bot the thread is bound to at creation (nullable only for
+ * rows predating migration 0005).
  * Timestamps are ISO-8601 UTC (DB stores epoch-ms; converted at the edge).
  */
 export type ThreadDto = {
   id: string;
+  botId: string | null;
   title: string;
   /** ISO-8601 UTC. */
   createdAt: string;

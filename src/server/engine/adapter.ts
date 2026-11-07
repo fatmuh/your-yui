@@ -217,6 +217,17 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
         join(tempDir, "settings.json"),
         JSON.stringify({ retry: { enabled: false, provider: { maxRetries: 0 } } }),
       );
+      // Multi-bot harness: the bot persona is a FULL-REPLACEMENT system
+      // prompt. The engine resolves it via DefaultResourceLoader's
+      // discoverSystemPromptFile(), which reads `agentDir/SYSTEM.md` — and
+      // tempDir IS the agentDir passed to createAgentSession below, so this
+      // one file replaces the engine's default coding-agent prompt (AD-1
+      // stays intact: the seam lives entirely inside this adapter). The
+      // contract guarantees a non-empty persona; an empty one would simply
+      // leave the engine default in place (defensive, never expected).
+      if (input.persona.trim().length > 0) {
+        writeFileSync(join(tempDir, "SYSTEM.md"), input.persona);
+      }
 
       // Materialisasi (AD-3): KEK fail-fast, decrypt hanya di stack ini.
       let apiKey: string;
