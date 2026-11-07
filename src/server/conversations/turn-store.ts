@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, max } from "drizzle-orm";
 import { monotonicFactory } from "ulidx";
 import { messages, threads, type Message, type Thread } from "../db/schema.ts";
 import type { YuiDatabase } from "../db/index.ts";
@@ -30,12 +30,63 @@ function deriveTitle(content: string): string {
   return Array.from(normalized).slice(0, TITLE_MAX_CHARS).join("");
 }
 
-/** Bump updatedAt thread (scope userId di SQL — thread asing tak tersentuh). */
-function touchThread(db: YuiDatabase, userId: string, threadId: string, at: number): void {
+/**
+ * Previous tick of the thread's logical clock: the newest message createdAt,
+ * falling back to the thread's current updatedAt when the thread has no
+ * messages yet. Null only for a thread that exists nowhere yet (brand-new
+ * thread) — there is nothing to regress against.
+ */
+function previousThreadTime(db: YuiDatabase, userId: string, threadId: string): number | null {
+  // The messages table carries no userId column — ownership is enforced by
+  // joining threads, keeping the module rule that every query scopes userId
+  // in SQL (a foreign threadId reads nothing here, like everywhere else).
+  const newestMessage = db
+    .select({ prevAt: max(messages.createdAt) })
+    .from(messages)
+    .innerJoin(threads, eq(messages.threadId, threads.id))
+    .where(and(eq(messages.threadId, threadId), eq(threads.userId, userId)))
+    .get();
+  if (newestMessage !== undefined && newestMessage.prevAt !== null) {
+    return newestMessage.prevAt;
+  }
+  return resolveThread(db, userId, threadId)?.updatedAt ?? null;
+}
+
+/**
+ * Per-thread logical clock (deferred review 3.3): createdAt/updatedAt carry
+ * epoch-ms straight from the caller's wall clock, so a regression (NTP step
+ * back) could misorder history and drop a just-written user message out of
+ * the last-20 transcript window. Every write instead uses
+ * max(inputAt, prevAt + 1) with prevAt = newest message createdAt of THIS
+ * thread (thread.updatedAt fallback for an empty thread), so the clock is
+ * strictly monotonic per thread no matter what the caller passes. Callers
+ * keep passing `at` — the defense lives here (depth behind the single
+ * writer, AD-5). The monotonic ULID factory stays the id tiebreaker; both
+ * orderings now point the same way.
+ */
+function monotonicThreadTime(
+  db: YuiDatabase,
+  userId: string,
+  threadId: string,
+  inputAt: number,
+): number {
+  const prevAt = previousThreadTime(db, userId, threadId);
+  return prevAt === null ? inputAt : Math.max(inputAt, prevAt + 1);
+}
+
+/**
+ * Bump updatedAt thread (scope userId di SQL — thread asing tak tersentuh).
+ * Non-regressing at the row level too: the bump never writes an updatedAt
+ * older than the one already stored. Returns the value actually applied.
+ */
+function touchThread(db: YuiDatabase, userId: string, threadId: string, at: number): number {
+  const current = resolveThread(db, userId, threadId)?.updatedAt;
+  const writeAt = current === undefined ? at : Math.max(at, current);
   db.update(threads)
-    .set({ updatedAt: at })
+    .set({ updatedAt: writeAt })
     .where(and(eq(threads.id, threadId), eq(threads.userId, userId)))
     .run();
+  return writeAt;
 }
 
 /**
@@ -69,9 +120,13 @@ export function createThreadWithMessage(
 ): CreatedThread {
   const threadId = newUlid();
   const title = deriveTitle(content);
-  db.insert(threads).values({ id: threadId, userId, title, createdAt: at, updatedAt: at }).run();
-  db.insert(messages).values({ id: newUlid(), threadId, role: "user", text: content, createdAt: at }).run();
-  return { threadId, title, updatedAt: at };
+  // Brand-new thread: nothing exists yet, so the clock has nothing to
+  // regress against — but the thread row and its first message still share
+  // one value straight from the same monotonic helper.
+  const writeAt = monotonicThreadTime(db, userId, threadId, at);
+  db.insert(threads).values({ id: threadId, userId, title, createdAt: writeAt, updatedAt: writeAt }).run();
+  db.insert(messages).values({ id: newUlid(), threadId, role: "user", text: content, createdAt: writeAt }).run();
+  return { threadId, title, updatedAt: writeAt };
 }
 
 export type AppendedMessage = {
@@ -81,6 +136,7 @@ export type AppendedMessage = {
    * asc (tiebreaker story 2).
    */
   messageId: string;
+  /** Thread bump tick actually applied (per-thread logical clock — monotonic). */
   updatedAt: number;
 };
 
@@ -92,9 +148,10 @@ export function appendUserMessage(
   at: number,
 ): AppendedMessage {
   const messageId = newUlid();
-  db.insert(messages).values({ id: messageId, threadId, role: "user", text, createdAt: at }).run();
-  touchThread(db, userId, threadId, at);
-  return { messageId, updatedAt: at };
+  const writeAt = monotonicThreadTime(db, userId, threadId, at);
+  db.insert(messages).values({ id: messageId, threadId, role: "user", text, createdAt: writeAt }).run();
+  const updatedAt = touchThread(db, userId, threadId, writeAt);
+  return { messageId, updatedAt };
 }
 
 export function appendAssistantMessage(
@@ -105,9 +162,10 @@ export function appendAssistantMessage(
   at: number,
 ): AppendedMessage {
   const messageId = newUlid();
-  db.insert(messages).values({ id: messageId, threadId, role: "assistant", text, createdAt: at }).run();
-  touchThread(db, userId, threadId, at);
-  return { messageId, updatedAt: at };
+  const writeAt = monotonicThreadTime(db, userId, threadId, at);
+  db.insert(messages).values({ id: messageId, threadId, role: "assistant", text, createdAt: writeAt }).run();
+  const updatedAt = touchThread(db, userId, threadId, writeAt);
+  return { messageId, updatedAt };
 }
 
 /**

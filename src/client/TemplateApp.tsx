@@ -60,7 +60,7 @@ export default function App() {
   const { signOut } = useSession()
   const [conversations, setConversations] = useState<Conversation[]>(() => [makeConversation(), {
     id: newId(), title: 'Yui', bot: 'yui', pinned: true,
-    messages: [{ id: newId(), role: 'assistant', text: "Hi Fathur, I'm Yui. What would you like to work on today? This is a local chat demo." }],
+    messages: [{ id: newId(), role: 'assistant', text: "Hi Fathur, I'm Yui. What would you like to work on today?" }],
   }])
   // Pinned to the first local conversation up front: the mount fetch below
   // prepends server threads to the array, which must never silently switch

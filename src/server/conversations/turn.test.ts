@@ -5,6 +5,7 @@ import { randomBytes } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Hono } from "hono";
 import { ulid } from "ulidx";
+import { asc, eq } from "drizzle-orm";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
 import { messages, threads } from "../db/schema.ts";
@@ -13,7 +14,13 @@ import { upsertProviderConfig } from "../providers/store.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../../tests/helpers/mock-openai.ts";
 import { postTurn, registerUser } from "../../../tests/helpers/api.ts";
 import { readSse, type SseEvent } from "../../../tests/helpers/sse.ts";
-import { assembleTranscript, createThreadWithMessage } from "./turn-store.ts";
+import {
+  appendAssistantMessage,
+  appendUserMessage,
+  assembleTranscript,
+  createThreadWithMessage,
+  resolveThread,
+} from "./turn-store.ts";
 
 // Bukti story 3 (route giliran = penulis tunggal AD-5 + konteks multi-giliran
 // server-side): dua giliran satu thread (transkrip giliran pertama masuk ISI
@@ -448,5 +455,107 @@ describe("penulis turn-store (unit)", () => {
 
     expect(title).toBe(`${"a".repeat(79)}${emoji}`);
     expect([...title]).toHaveLength(80);
+  });
+});
+
+// Logical clock (deferred review 3.3): the turn-store writers must defend
+// against a wall-clock regression (NTP step back) on their own — even a
+// caller passing a stale `at` can never make per-thread history go backwards
+// or push a just-written message out of the last-20 transcript window.
+// better-sqlite3 is synchronous, so crafted timestamps are fully deterministic.
+describe("per-thread logical clock (unit)", () => {
+  it("appending with `at` older than the newest message still lands after it", async () => {
+    const { app, db } = makeApp();
+    const user = await registerUser(app, "clock-regressed-append");
+    const base = Date.now();
+    const threadId = createThreadWithMessage(db, user.userId, "pertanyaan awal", base).threadId;
+    appendAssistantMessage(db, user.userId, threadId, "jawaban awal", base + 10);
+
+    // Wall clock steps 5s backwards between writes.
+    const appended = appendUserMessage(db, user.userId, threadId, "jam mundur", base - 5_000);
+
+    const row = db.select().from(messages).where(eq(messages.id, appended.messageId)).get()!;
+    expect(row.createdAt).toBeGreaterThan(base + 10);
+    expect(appended.updatedAt).toBe(row.createdAt);
+  });
+
+  it("after 25 messages with regressed input clocks, the last-20 transcript still ends with the most recent user message", async () => {
+    const { app, db } = makeApp();
+    const user = await registerUser(app, "clock-window");
+    const base = Date.now();
+    const threadId = createThreadWithMessage(db, user.userId, "pesan-00", base).threadId;
+    let clock = base;
+    for (let i = 1; i < 25; i += 1) {
+      // NTP-style regression every few writes; the newest message (i=24)
+      // is written under a regressed clock on purpose.
+      clock += i % 6 === 0 ? -500 : 7;
+      const text = `pesan-${String(i).padStart(2, "0")}`;
+      if (i % 2 === 1) {
+        appendAssistantMessage(db, user.userId, threadId, text, clock);
+      } else {
+        appendUserMessage(db, user.userId, threadId, text, clock);
+      }
+    }
+
+    const lines = assembleTranscript(db, user.userId, threadId).split("\n");
+    expect(lines).toHaveLength(20);
+    expect(lines[0]).toBe("assistant: pesan-05");
+    expect(lines[lines.length - 1]).toBe("user: pesan-24");
+    expect(lines.join("\n")).not.toContain("pesan-04");
+  });
+
+  it("history ascending order holds across a clock regression", async () => {
+    const { app, db } = makeApp();
+    const user = await registerUser(app, "clock-asc-order");
+    const base = Date.now();
+    const threadId = createThreadWithMessage(db, user.userId, "pesan-00", base).threadId;
+    let clock = base;
+    for (let i = 1; i < 12; i += 1) {
+      clock += i % 3 === 0 ? -1_000 : 5;
+      const text = `pesan-${String(i).padStart(2, "0")}`;
+      if (i % 2 === 1) {
+        appendAssistantMessage(db, user.userId, threadId, text, clock);
+      } else {
+        appendUserMessage(db, user.userId, threadId, text, clock);
+      }
+    }
+
+    // Same ordering as the history route: createdAt asc, id asc tiebreaker.
+    const rows = db
+      .select()
+      .from(messages)
+      .where(eq(messages.threadId, threadId))
+      .orderBy(asc(messages.createdAt), asc(messages.id))
+      .all();
+    expect(rows.map((row) => row.text)).toEqual(
+      Array.from({ length: 12 }, (_, i) => `pesan-${String(i).padStart(2, "0")}`),
+    );
+    for (let i = 1; i < rows.length; i += 1) {
+      expect(rows[i]!.createdAt).toBeGreaterThan(rows[i - 1]!.createdAt);
+    }
+  });
+
+  it("thread updatedAt never moves backwards", async () => {
+    const { app, db } = makeApp();
+    const user = await registerUser(app, "clock-updatedat");
+    const base = Date.now();
+    const created = createThreadWithMessage(db, user.userId, "pertanyaan", base);
+    const before = resolveThread(db, user.userId, created.threadId)!.updatedAt;
+    expect(created.updatedAt).toBe(before);
+
+    // Append with a clock far in the past: the row's updatedAt only moves up.
+    const appended = appendUserMessage(db, user.userId, created.threadId, "jam mundur", base - 60_000);
+    const after = resolveThread(db, user.userId, created.threadId)!.updatedAt;
+    expect(after).toBeGreaterThan(before);
+    expect(appended.updatedAt).toBe(after);
+
+    // Same guarantee for a thread that has no messages yet (empty-thread
+    // fallback to the stored updatedAt): a past clock cannot pull it back.
+    const emptyId = seedThread(db, user.userId);
+    const emptyBefore = resolveThread(db, user.userId, emptyId)!.updatedAt;
+    const emptyAppend = appendUserMessage(db, user.userId, emptyId, "thread kosong", emptyBefore - 60_000);
+    const emptyAfter = resolveThread(db, user.userId, emptyId)!.updatedAt;
+    expect(emptyAfter).toBeGreaterThanOrEqual(emptyBefore);
+    expect(emptyAppend.updatedAt).toBe(emptyAfter);
   });
 });

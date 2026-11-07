@@ -347,7 +347,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: #1f2933;
   background: #f5f7fa;
 }
-.auth-card {
+.gate-shell .auth-card {
   width: 100%;
   max-width: 22rem;
   background: #ffffff;
@@ -357,34 +357,34 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   display: grid;
   gap: 1rem;
 }
-.auth-card h2 {
+.gate-shell .auth-card h2 {
   margin: 0;
   font-size: 1.125rem;
 }
-.auth-card form {
+.gate-shell .auth-card form {
   display: grid;
   gap: 1rem;
 }
-.form-field {
+.gate-shell .form-field {
   display: grid;
   gap: 0.375rem;
 }
-.form-field label {
+.gate-shell .form-field label {
   font-size: 0.875rem;
   font-weight: 600;
 }
-.form-field input {
+.gate-shell .form-field input {
   padding: 0.5rem 0.625rem;
   border: 1px solid #cbd2d9;
   border-radius: 6px;
   font-size: 1rem;
 }
-.form-error {
+.gate-shell .form-error {
   margin: 0;
   color: #b3261e;
   font-size: 0.875rem;
 }
-.button-primary {
+.gate-shell .button-primary {
   padding: 0.5rem 0.875rem;
   border: none;
   border-radius: 6px;
@@ -393,11 +393,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: 1rem;
   cursor: pointer;
 }
-.button-primary:disabled {
+.gate-shell .button-primary:disabled {
   opacity: 0.6;
   cursor: default;
 }
-.button-link {
+.gate-shell .button-link {
   border: none;
   background: none;
   padding: 0;

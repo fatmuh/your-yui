@@ -438,19 +438,6 @@ describe("served build — multi-turn over HTTP, two-account isolation, restart 
   type HistoryMessage = { id: string; role: string; text: string; createdAt: string };
   type ThreadSummary = { id: string; title: string };
 
-  /** Only the provider API POSTs. The engine stack also fires background
-   * `GET /` reachability probes at the provider origin (traced, no body); they
-   * land in the mock's request log asynchronously, so assertions on the wire
-   * contract must filter them out instead of trusting request indices. */
-  function apiPosts<Request extends { method: string | undefined; url: string | undefined }>(
-    requests: Request[],
-    pathPrefix: string,
-  ): Request[] {
-    return requests.filter(
-      (request) => request.method === "POST" && request.url !== undefined && request.url.startsWith(pathPrefix),
-    );
-  }
-
   it("multi-turn, two provider kinds, one thread: server-assembled transcript + REST history", async () => {
     const openaiMock = await startMockOpenAI({ replyText: turn1Reply });
     openMocks.push(openaiMock);
@@ -483,9 +470,9 @@ describe("served build — multi-turn over HTTP, two-account isolation, restart 
       reply: turn1Reply,
     });
     // The mock received the key that was PUT (decryption happened in the child).
-    const openaiPosts = apiPosts(openaiMock.requests, "/v1/chat/completions");
-    expect(openaiPosts).toHaveLength(1);
-    expect(openaiPosts[0].authorization).toBe(`Bearer ${OPENAI_API_KEY}`);
+    // `requests` is already clean — the mock helpers only record provider API POSTs there (background `GET /` probes go to `probes`).
+    expect(openaiMock.requests).toHaveLength(1);
+    expect(openaiMock.requests[0].authorization).toBe(`Bearer ${OPENAI_API_KEY}`);
 
     // Turn 2 — same thread, explicit anthropic kind: kind is chosen per turn.
     const turn2 = await postTurn(aliceCookie, {
@@ -504,11 +491,10 @@ describe("served build — multi-turn over HTTP, two-account isolation, restart 
     // turn 1's user content AND turn 1's assistant reply — the transcript was
     // assembled server-side from the stored thread (AD-5), not echoed by the
     // client, and it also carries the turn-2 user content just written.
-    const anthropicPosts = apiPosts(anthropicMock.requests, "/v1/messages");
-    expect(anthropicPosts).toHaveLength(1);
-    expect(anthropicPosts[0].body).toContain(turn1Content);
-    expect(anthropicPosts[0].body).toContain(turn1Reply);
-    expect(anthropicPosts[0].body).toContain(turn2Content);
+    expect(anthropicMock.requests).toHaveLength(1);
+    expect(anthropicMock.requests[0].body).toContain(turn1Content);
+    expect(anthropicMock.requests[0].body).toContain(turn1Reply);
+    expect(anthropicMock.requests[0].body).toContain(turn2Content);
 
     // History via REST: exactly 4 messages, alternating roles, exact texts.
     const history = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
@@ -646,10 +632,9 @@ describe("served build — multi-turn over HTTP, two-account isolation, restart 
 
     // Cross-restart transcript: turn 3's request body still carries turn 1's
     // content — the new child reassembled history written by the old one.
-    const anthropicTurns = apiPosts(anthropicMock.requests, "/v1/messages");
-    expect(anthropicTurns).toHaveLength(2);
-    expect(anthropicTurns[1].body).toContain(turn1Content);
-    expect(anthropicTurns[1].body).toContain(turn3Content);
+    expect(anthropicMock.requests).toHaveLength(2);
+    expect(anthropicMock.requests[1].body).toContain(turn1Content);
+    expect(anthropicMock.requests[1].body).toContain(turn3Content);
 
     // History now holds exactly 6 messages; turn 3 reused the turn-2 mock, so
     // its assistant text is the turn-2 reply text.
