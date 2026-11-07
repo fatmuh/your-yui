@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ulid } from "ulidx";
 import { SESSION_COOKIE } from "./auth/cookies.ts";
 import { startMockAnthropic, type MockAnthropic } from "../../tests/helpers/mock-anthropic.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../tests/helpers/mock-openai.ts";
@@ -652,5 +653,240 @@ describe("served build — multi-turn over HTTP, two-account isolation, restart 
       ["user", turn3Content],
       ["assistant", turn2Reply],
     ]);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// epic-voice ticket 5 — the whole voice chain on the served build: a real
+// multipart upload over HTTP, a voice turn whose SERVER-DERIVED placeholder
+// reaches the provider transcript, REST history carrying the audio reference,
+// byte-identical playback, cross-account isolation on the blob, and a restart
+// with the same DATA_DIR that keeps session/history/blob alive for a SECOND
+// voice turn. Declaration order is the contract (see the describe above).
+// ---------------------------------------------------------------------------
+describe("served build — voice end-to-end: upload, turn, history, playback, isolation, restart", () => {
+  // State shared by the three tests below; the restart test swaps the
+  // module-level child/baseUrl exactly like the describe above.
+  let aliceCookie = "";
+  let aliceThreadId = "";
+  let aliceAudioId = "";
+  let voiceMock: MockOpenAI | null = null;
+
+  const voiceReply = "Served voice mock reply: the voice chain answers through a real socket.";
+
+  type VoiceHistoryMessage = {
+    id: string;
+    role: string;
+    text: string;
+    audio?: { id: string; mime: string; durationMs: number };
+    createdAt: string;
+  };
+
+  /** Deterministic byte pattern (prime stride 251, no long zero runs). */
+  function patternBytes(length: number, seed: number): Uint8Array {
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < bytes.length; i += 1) {
+      bytes[i] = (i * 7 + seed) % 251;
+    }
+    return bytes;
+  }
+
+  /** Real multipart upload through the served child; returns the stored id. */
+  async function uploadAudio(
+    cookie: string,
+    bytes: Uint8Array,
+    durationMs: number,
+  ): Promise<string> {
+    const form = new FormData();
+    form.append("file", new File([bytes], "note.webm", { type: "audio/webm" }));
+    form.append("durationMs", String(durationMs));
+    const res = await requestJson("/api/audio", {
+      method: "POST",
+      headers: { cookie },
+      body: form,
+    });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ id: expect.any(String), mime: "audio/webm", durationMs });
+    return (res.body as { id: string }).id;
+  }
+
+  /** Playback through the served child; the raw body is recorded for the R2
+   * audit like every other response (decoded text of the exact bytes). */
+  async function fetchAudioBytes(
+    cookie: string,
+    audioId: string,
+  ): Promise<{ status: number; headers: Headers; bytes: Buffer }> {
+    const res = await fetch(`${baseUrl}/api/audio/${audioId}`, { headers: { cookie } });
+    const bytes = Buffer.from(await res.arrayBuffer());
+    responseBodies.push(bytes.toString("utf8"));
+    return { status: res.status, headers: res.headers, bytes };
+  }
+
+  it("upload → voice turn → history + playback: placeholder reaches the provider, bytes round-trip", async () => {
+    voiceMock = await startMockOpenAI({ replyText: voiceReply });
+    openMocks.push(voiceMock);
+    aliceCookie = await registerUser("probe-voice");
+    const put = await putConfig(aliceCookie, "openai-compatible", {
+      apiKey: OPENAI_API_KEY,
+      baseUrl: voiceMock.baseUrl,
+      modelId: "mock-model",
+    });
+    expect(put.maskedHint).toBe("sk-…abcd");
+
+    // Real multipart upload over HTTP: 2048 deterministic bytes, 7000 ms — a
+    // duration whose 0:07 placeholder cannot be confused with minutes.
+    const uploaded = patternBytes(2048, 11);
+    aliceAudioId = await uploadAudio(aliceCookie, uploaded, 7000);
+
+    // Voice turn: audioId INSTEAD of content; the server derives the stored
+    // text and the stream still satisfies the full turn contract.
+    const turn = await postTurn(aliceCookie, {
+      audioId: aliceAudioId,
+      clientToken: "tok-served-voice",
+    });
+    aliceThreadId = threadIdFromEvents(turn.events);
+    assertFullContract(turn.events, {
+      threadId: aliceThreadId,
+      clientToken: "tok-served-voice",
+      reply: voiceReply,
+    });
+
+    // The server-derived placeholder reached the provider: the transcript the
+    // mock received carries the turn's user line verbatim.
+    expect(voiceMock.requests).toHaveLength(1);
+    const lastRequest = voiceMock.requests[voiceMock.requests.length - 1]!;
+    expect(lastRequest.body).toContain("user: [Voice note: 0:07]");
+
+    // History via REST: the user message holds the placeholder text AND the
+    // attached audio reference {id, mime, durationMs}.
+    const history = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(history.status).toBe(200);
+    const messages = history.body as VoiceHistoryMessage[];
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatchObject({ role: "user", text: "[Voice note: 0:07]" });
+    expect(messages[0].audio).toEqual({ id: aliceAudioId, mime: "audio/webm", durationMs: 7000 });
+    expect(messages[1]).toMatchObject({ role: "assistant", text: voiceReply });
+
+    // Playback by the owner: 200, the stored mime, the REAL byte count, and
+    // bytes identical to what was uploaded.
+    const playback = await fetchAudioBytes(aliceCookie, aliceAudioId);
+    expect(playback.status).toBe(200);
+    expect(playback.headers.get("content-type")).toBe("audio/webm");
+    expect(playback.headers.get("content-length")).toBe("2048");
+    expect(playback.bytes.equals(Buffer.from(uploaded))).toBe(true);
+  }, 60_000);
+
+  it("isolation: bob can neither play nor attach alice's blob — identical 404s, rejection before any stream", async () => {
+    // Guard BOTH shared ids (not just the last-set one): a partial failure in
+    // test 1 must land here as "test order broken", not as a confusing 404 on
+    // an empty thread id.
+    if (aliceAudioId === "" || aliceThreadId === "") {
+      throw new Error("alice audio/thread state missing — test order broken");
+    }
+    const bobCookie = await registerUser("probe-voice-bob");
+
+    // Door 1 — bob playing alice's blob: a 404 envelope byte-identical to the
+    // one for a well-formed id that simply does not exist (no existence leak).
+    const foreign = await requestJson(`/api/audio/${aliceAudioId}`, {
+      headers: { cookie: bobCookie },
+    });
+    expect(foreign.status).toBe(404);
+    expect(foreign.body).toMatchObject({ error: { code: "not_found" } });
+    const unknown = await requestJson(`/api/audio/${ulid()}`, { headers: { cookie: bobCookie } });
+    expect(unknown.status).toBe(404);
+    expect(foreign.body).toEqual(unknown.body);
+
+    // Door 2 — bob attaching alice's blob to a turn of his own (no content,
+    // audioId only): 404 JSON envelope BEFORE any stream, so nothing is ever
+    // written and no SSE headers are sent.
+    const turn = await requestJson("/api/engine/turn", {
+      method: "POST",
+      headers: { ...JSON_HEADERS, cookie: bobCookie },
+      body: JSON.stringify({ audioId: aliceAudioId, clientToken: "tok-bob-voice-isolated" }),
+    });
+    expect(turn.status).toBe(404);
+    expect(turn.headers.get("content-type")).toContain("application/json");
+    expect(turn.body).toMatchObject({ error: { code: "not_found" } });
+
+    // Alice's thread is untouched by both attempts.
+    const aliceHistory = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(aliceHistory.status).toBe(200);
+    expect(aliceHistory.body).toHaveLength(2);
+  }, 60_000);
+
+  it("restart with same DATA_DIR: history + blob identical, original cookie valid, second voice turn works", async () => {
+    if (voiceMock === null || aliceAudioId === "" || aliceThreadId === "") {
+      throw new Error("voice state missing — test order broken");
+    }
+
+    // Snapshot from the OLD child right before it is stopped (self-contained
+    // within this test, like the restart test above).
+    const historyBefore = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(historyBefore.status).toBe(200);
+    expect(historyBefore.body).toHaveLength(2);
+    const playbackBefore = await fetchAudioBytes(aliceCookie, aliceAudioId);
+    expect(playbackBefore.status).toBe(200);
+
+    if (child === null) throw new Error("served child missing — test order broken");
+    await stopChild(child);
+    // Reserve the replacement port AFTER the old child released its socket —
+    // same reasoning as the restart test above.
+    const newPort = await reservePort();
+    child = await spawnServed(newPort);
+    baseUrl = `http://127.0.0.1:${newPort}`;
+
+    // Alice's ORIGINAL cookie still works (sessions live in the DB); history
+    // is deep-equal to the pre-restart snapshot, audio reference intact.
+    const historyAfter = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(historyAfter.status).toBe(200);
+    expect(historyAfter.body).toEqual(historyBefore.body);
+
+    // The blob survived the restart: same status, mime, and IDENTICAL bytes.
+    const playbackAfter = await fetchAudioBytes(aliceCookie, aliceAudioId);
+    expect(playbackAfter.status).toBe(200);
+    expect(playbackAfter.headers.get("content-type")).toBe("audio/webm");
+    expect(playbackAfter.bytes.equals(playbackBefore.bytes)).toBe(true);
+
+    // SECOND voice turn after the restart — a fresh upload + attach proves the
+    // whole chain is live in the new child (the mock still lives in the test
+    // process, so the stream runs to a full contract on the same thread).
+    const uploaded2 = patternBytes(1024, 77);
+    const audioId2 = await uploadAudio(aliceCookie, uploaded2, 3000);
+    const turn2 = await postTurn(aliceCookie, {
+      threadId: aliceThreadId,
+      audioId: audioId2,
+      clientToken: "tok-served-voice-2",
+    });
+    assertFullContract(turn2.events, {
+      threadId: aliceThreadId,
+      clientToken: "tok-served-voice-2",
+      reply: voiceReply,
+    });
+
+    // The new child reassembled history written by the old one: the turn-2
+    // request carries BOTH placeholders in its transcript.
+    expect(voiceMock.requests).toHaveLength(2);
+    const lastRequest = voiceMock.requests[voiceMock.requests.length - 1]!;
+    expect(lastRequest.body).toContain("user: [Voice note: 0:07]");
+    expect(lastRequest.body).toContain("user: [Voice note: 0:03]");
+
+    // History now ends with the new voice message + its assistant reply.
+    const finalHistory = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(finalHistory.status).toBe(200);
+    const messages = finalHistory.body as VoiceHistoryMessage[];
+    expect(messages).toHaveLength(4);
+    expect(messages[2]).toMatchObject({ role: "user", text: "[Voice note: 0:03]" });
+    expect(messages[2].audio).toEqual({ id: audioId2, mime: "audio/webm", durationMs: 3000 });
+    expect(messages[3]).toMatchObject({ role: "assistant", text: voiceReply });
   }, 60_000);
 });
