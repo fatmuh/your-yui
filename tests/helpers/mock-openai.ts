@@ -16,8 +16,14 @@ export type MockRequest = {
 export type MockOpenAI = {
   /** Basis URL untuk config penyedia (sudah termasuk /v1, konvensi engine). */
   baseUrl: string;
-  /** Semua request yang diterima — untuk asersi (mis. kunci Bearer yang sampai). */
+  /** Provider API calls (POST /v1/chat/completions) — for assertions such as
+   * the Bearer key that reached the wire. Background reachability probes the
+   * engine fires at the origin (credential sync `GET /`) are excluded so
+   * count/positional assertions never race them; see `probes`. */
   requests: MockRequest[];
+  /** Non-API requests received (e.g. engine credential-sync reachability
+   * probes) — recorded for visibility, never asserted. */
+  probes: MockRequest[];
   close(): Promise<void>;
 };
 
@@ -52,16 +58,29 @@ export function startMockOpenAI(options: MockOpenAIOptions = {}): Promise<MockOp
   const chunkDelayMs = options.chunkDelayMs ?? 15;
 
   const requests: MockRequest[] = [];
+  const probes: MockRequest[] = [];
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
-      requests.push({
+      const record = {
         method: req.method,
         url: req.url,
         authorization: req.headers.authorization,
         body: Buffer.concat(chunks).toString("utf8"),
-      });
+      };
+      // Only provider API calls belong in `requests`: the engine's credential
+      // sync fires a background `GET /` reachability probe at the origin on
+      // every turn, and assertions on counts/positions must not race it.
+      // The path is compared query-stripped and exact so a future SDK query
+      // suffix cannot misfile a real call, and sub-paths (e.g. count_tokens)
+      // stay out.
+      const path = (req.url ?? "").split("?")[0]!;
+      if (req.method === "POST" && path === "/v1/chat/completions") {
+        requests.push(record);
+      } else {
+        probes.push(record);
+      }
 
       if (behavior === "http500") {
         res.writeHead(500, { "content-type": "application/json" });
@@ -109,6 +128,7 @@ export function startMockOpenAI(options: MockOpenAIOptions = {}): Promise<MockOp
       resolve({
         baseUrl: `http://127.0.0.1:${address.port}/v1`,
         requests,
+        probes,
         close: () =>
           new Promise<void>((resolveClose) => {
             server.close(() => resolveClose());

@@ -76,6 +76,11 @@ async function spawnServed(port: number): Promise<ChildProcess> {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  // Output THIS child produced only — the listening-marker scan must not see
+  // the previous child's log (shared childOutput accumulates across spawns),
+  // so any port, even a re-issued one, resolves unambiguously.
+  let spawnedOutput = "";
+
   await new Promise<void>((resolve, reject) => {
     const marker = `listening on http://localhost:${port}`;
     let settled = false;
@@ -88,7 +93,7 @@ async function spawnServed(port: number): Promise<ChildProcess> {
       spawned.kill("SIGKILL");
       reject(
         new Error(
-          `anak proses tak mengumumkan "${marker}" dalam 30 detik\n--- stdout+stderr anak ---\n${childOutput}`,
+          `anak proses tak mengumumkan "${marker}" dalam 30 detik\n--- stdout+stderr anak ---\n${spawnedOutput}`,
         ),
       );
     }, 30_000);
@@ -101,11 +106,13 @@ async function spawnServed(port: number): Promise<ChildProcess> {
     spawned.stdout!.setEncoding("utf8");
     spawned.stdout!.on("data", (chunk: string) => {
       childOutput += chunk;
-      if (childOutput.includes(marker)) succeed();
+      spawnedOutput += chunk;
+      if (spawnedOutput.includes(marker)) succeed();
     });
     spawned.stderr!.setEncoding("utf8");
     spawned.stderr!.on("data", (chunk: string) => {
       childOutput += chunk;
+      spawnedOutput += chunk;
     });
     spawned.on("exit", (code, signal) => {
       if (settled) return;
@@ -113,7 +120,7 @@ async function spawnServed(port: number): Promise<ChildProcess> {
       clearTimeout(timer);
       reject(
         new Error(
-          `anak proses mati sebelum listening (code=${code} signal=${signal})\n--- stdout+stderr anak ---\n${childOutput}`,
+          `anak proses mati sebelum listening (code=${code} signal=${signal})\n--- stdout+stderr anak ---\n${spawnedOutput}`,
         ),
       );
     });
@@ -283,7 +290,8 @@ afterAll(async () => {
     await stopChild(child);
     // Anak sudah exit dan seluruh outputnya tertangkap — audit ulang R2 agar
     // kebocoran kunci SETELAH test terakhir (mis. log saat shutdown/SIGTERM)
-    // pun memerahkan suite, bukan lolos tanpa diperiksa.
+    // pun memerahkan suite, bukan lolos tanpa diperiksa. childOutput
+    // terakumulasi lintas spawn → audit ini meliputi SEMUA anak proses.
     expect(childOutput).not.toContain(OPENAI_API_KEY);
     expect(childOutput).not.toContain(ANTHROPIC_API_KEY);
   }
@@ -291,6 +299,14 @@ afterAll(async () => {
     await openMocks.pop()?.close();
   }
   rmSync(DATA_DIR, { recursive: true, force: true });
+  // R2 audit penuh di akhir file: kunci utuh KEDUA jenis absen dari SETIAP
+  // body respons yang pernah diterima test — termasuk respons describe
+  // kedua (restart, config view, SSE giliran-3) yang tak tercakup audit
+  // mid-suite test terakhir describe pertama.
+  for (const body of responseBodies) {
+    expect(body).not.toContain(OPENAI_API_KEY);
+    expect(body).not.toContain(ANTHROPIC_API_KEY);
+  }
 }, 15_000);
 
 describe("probe build tersaji — anak proses produksi lewat HTTP+SSE nyata", () => {
@@ -387,13 +403,269 @@ describe("probe build tersaji — anak proses produksi lewat HTTP+SSE nyata", ()
     expect(mock.requests[0].apiKeyHeader).toBe(ANTHROPIC_API_KEY);
     expect(mock.requests[0].body).toContain("Giliran uji anthropic pada proses penyajian");
 
-    // R2 pada proses nyata: kunci utuh KEDUA jenis absen dari setiap body
-    // respons yang pernah diterima test maupun stdout/stderr anak proses.
-    for (const body of responseBodies) {
-      expect(body).not.toContain(OPENAI_API_KEY);
-      expect(body).not.toContain(ANTHROPIC_API_KEY);
-    }
+    // R2 pada proses nyata: kunci utuh KEDUA jenis absen dari stdout/stderr
+    // anak proses hingga titik ini (audit penuh semua body respons + kedua
+    // anak proses berjalan di afterAll).
     expect(childOutput).not.toContain(OPENAI_API_KEY);
     expect(childOutput).not.toContain(ANTHROPIC_API_KEY);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Ticket 7 — integrated verification of the served build: multi-turn context
+// through the full HTTP path, two-account isolation, and persistence across a
+// process restart with the same DATA_DIR + KEK. Vitest runs tests in
+// declaration order, so this describe (and the child swap its last test
+// performs) can never disturb the tests above.
+// ---------------------------------------------------------------------------
+describe("served build — multi-turn over HTTP, two-account isolation, restart persistence", () => {
+  // State shared by the three tests below (declaration order is the contract).
+  // Provider mocks live in the TEST process, so they stay reachable when the
+  // served child process is replaced by a fresh one in the restart test.
+  let aliceCookie = "";
+  let aliceThreadId = "";
+  let anthropicMock: MockAnthropic | null = null;
+
+  // Unique per run of this file: one content marker per turn, one reply text
+  // per mock instance. Turn 3 reuses the turn-2 anthropic mock by design, so
+  // its reply text is the turn-2 reply text.
+  const turn1Content = "Served multi-turn marker one 4d71";
+  const turn2Content = "Served multi-turn marker two 8be3";
+  const turn3Content = "Served multi-turn marker three c9f2";
+  const turn1Reply = "Served mock reply one: openai adapter answers turn one.";
+  const turn2Reply = "Served mock reply two: anthropic adapter answers turn two.";
+
+  type HistoryMessage = { id: string; role: string; text: string; createdAt: string };
+  type ThreadSummary = { id: string; title: string };
+
+  /** Only the provider API POSTs. The engine stack also fires background
+   * `GET /` reachability probes at the provider origin (traced, no body); they
+   * land in the mock's request log asynchronously, so assertions on the wire
+   * contract must filter them out instead of trusting request indices. */
+  function apiPosts<Request extends { method: string | undefined; url: string | undefined }>(
+    requests: Request[],
+    pathPrefix: string,
+  ): Request[] {
+    return requests.filter(
+      (request) => request.method === "POST" && request.url !== undefined && request.url.startsWith(pathPrefix),
+    );
+  }
+
+  it("multi-turn, two provider kinds, one thread: server-assembled transcript + REST history", async () => {
+    const openaiMock = await startMockOpenAI({ replyText: turn1Reply });
+    openMocks.push(openaiMock);
+    anthropicMock = await startMockAnthropic({ replyText: turn2Reply });
+    openMocks.push(anthropicMock);
+
+    aliceCookie = await registerUser("probe-alice");
+    const openaiPut = await putConfig(aliceCookie, "openai-compatible", {
+      apiKey: OPENAI_API_KEY,
+      baseUrl: openaiMock.baseUrl,
+      modelId: "mock-model",
+    });
+    expect(openaiPut.maskedHint).toBe("sk-…abcd");
+    const anthropicPut = await putConfig(aliceCookie, "anthropic", {
+      apiKey: ANTHROPIC_API_KEY,
+      baseUrl: anthropicMock.baseUrl,
+    });
+    expect(anthropicPut.maskedHint).toBe("sk-…wxyz");
+
+    // Turn 1 — no threadId: the default kind (openai-compatible) runs and the
+    // server creates the thread; its id comes from the final event.
+    const turn1 = await postTurn(aliceCookie, {
+      content: turn1Content,
+      clientToken: "tok-mt-one",
+    });
+    aliceThreadId = threadIdFromEvents(turn1.events);
+    assertFullContract(turn1.events, {
+      threadId: aliceThreadId,
+      clientToken: "tok-mt-one",
+      reply: turn1Reply,
+    });
+    // The mock received the key that was PUT (decryption happened in the child).
+    const openaiPosts = apiPosts(openaiMock.requests, "/v1/chat/completions");
+    expect(openaiPosts).toHaveLength(1);
+    expect(openaiPosts[0].authorization).toBe(`Bearer ${OPENAI_API_KEY}`);
+
+    // Turn 2 — same thread, explicit anthropic kind: kind is chosen per turn.
+    const turn2 = await postTurn(aliceCookie, {
+      kind: "anthropic",
+      threadId: aliceThreadId,
+      content: turn2Content,
+      clientToken: "tok-mt-two",
+    });
+    assertFullContract(turn2.events, {
+      threadId: aliceThreadId,
+      clientToken: "tok-mt-two",
+      reply: turn2Reply,
+    });
+
+    // MULTI-TURN CONTEXT PROOF: the recorded anthropic request body carries
+    // turn 1's user content AND turn 1's assistant reply — the transcript was
+    // assembled server-side from the stored thread (AD-5), not echoed by the
+    // client, and it also carries the turn-2 user content just written.
+    const anthropicPosts = apiPosts(anthropicMock.requests, "/v1/messages");
+    expect(anthropicPosts).toHaveLength(1);
+    expect(anthropicPosts[0].body).toContain(turn1Content);
+    expect(anthropicPosts[0].body).toContain(turn1Reply);
+    expect(anthropicPosts[0].body).toContain(turn2Content);
+
+    // History via REST: exactly 4 messages, alternating roles, exact texts.
+    const history = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(history.status).toBe(200);
+    const before = history.body as HistoryMessage[];
+    expect(before).toHaveLength(4);
+    expect(before.map((message) => [message.role, message.text])).toEqual([
+      ["user", turn1Content],
+      ["assistant", turn1Reply],
+      ["user", turn2Content],
+      ["assistant", turn2Reply],
+    ]);
+
+    // The thread is listed for alice, titled after its first user message.
+    const list = await requestJson("/api/threads", { headers: { cookie: aliceCookie } });
+    expect(list.status).toBe(200);
+    const threads = list.body as ThreadSummary[];
+    expect(threads).toHaveLength(1);
+    expect(threads[0].id).toBe(aliceThreadId);
+    expect(threads[0].title).toBe(turn1Content);
+  }, 60_000);
+
+  it("two-account isolation: bob never reaches alice's thread through list, history, or turn", async () => {
+    if (aliceThreadId === "") throw new Error("alice thread missing — test order broken");
+
+    const bobCookie = await registerUser("probe-bob");
+
+    // Positive control: alice's cookie DOES reach the thread, so bob's 404s
+    // below prove isolation, not a thread that never existed.
+    const aliceHistory = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(aliceHistory.status).toBe(200);
+    expect(aliceHistory.body).toHaveLength(4);
+
+    // Door 1 — thread list: exactly [] (alice's thread does not leak).
+    const list = await requestJson("/api/threads", { headers: { cookie: bobCookie } });
+    expect(list.status).toBe(200);
+    expect(list.body).toEqual([]);
+
+    // Door 2 — reading alice's history: 404 envelope, identical to the
+    // response for a thread that does not exist (no existence leak).
+    const history = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: bobCookie },
+    });
+    expect(history.status).toBe(404);
+    expect(history.body).toMatchObject({ error: { code: "not_found" } });
+
+    // Door 3 — writing a turn into alice's thread: 404 envelope BEFORE any
+    // streaming, i.e. a plain JSON response, never an SSE stream.
+    const turn = await requestJson("/api/engine/turn", {
+      method: "POST",
+      headers: { ...JSON_HEADERS, cookie: bobCookie },
+      body: JSON.stringify({
+        threadId: aliceThreadId,
+        content: "Bob attempts to write into alice's thread",
+        clientToken: "tok-bob-isolated",
+      }),
+    });
+    expect(turn.status).toBe(404);
+    expect(turn.body).toMatchObject({ error: { code: "not_found" } });
+    expect(turn.headers.get("content-type")).toContain("application/json");
+  }, 60_000);
+
+  it("restart with same DATA_DIR + KEK: history identical, session + configs survive, turn 3 keeps writing", async () => {
+    if (anthropicMock === null) throw new Error("anthropic mock missing — test order broken");
+
+    // Snapshot everything that must survive the restart, read fresh from the
+    // OLD child right before it is stopped (self-contained within this test).
+    const historyBefore = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(historyBefore.status).toBe(200);
+    expect(historyBefore.body).toHaveLength(4);
+
+    const listBefore = await requestJson("/api/threads", { headers: { cookie: aliceCookie } });
+    expect(listBefore.status).toBe(200);
+    const threadsBefore = listBefore.body as ThreadSummary[];
+    expect(threadsBefore).toHaveLength(1);
+    expect(threadsBefore[0].id).toBe(aliceThreadId);
+    const titleBefore = threadsBefore[0].title;
+
+    if (child === null) throw new Error("served child missing — test order broken");
+    await stopChild(child);
+    // Reserve the replacement port AFTER the old child released its socket:
+    // spawnServed scans only ITS OWN output for the listening marker, so even
+    // a re-issued port stays unambiguous — and the unheld-port window other
+    // ephemeral allocations could steal from stays as short as possible.
+    const newPort = await reservePort();
+    child = await spawnServed(newPort);
+    baseUrl = `http://127.0.0.1:${newPort}`;
+
+    // Alice's ORIGINAL cookie still works: sessions live in the DB table
+    // auth_sessions, not in process memory. History is deep-equal to the
+    // pre-restart snapshot (same ids, roles, texts, createdAt).
+    const historyAfter = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(historyAfter.status).toBe(200);
+    expect(historyAfter.body).toEqual(historyBefore.body);
+
+    // The thread is still listed under the same title.
+    const listAfter = await requestJson("/api/threads", { headers: { cookie: aliceCookie } });
+    expect(listAfter.status).toBe(200);
+    const threadsAfter = listAfter.body as ThreadSummary[];
+    expect(threadsAfter.map((thread) => ({ id: thread.id, title: thread.title }))).toEqual([
+      { id: aliceThreadId, title: titleBefore },
+    ]);
+
+    // Both provider configs survive the restart (stored ciphertext + the same
+    // KEK from env) with the same masked hints and no raw key in the view.
+    const openaiView = await getConfig(aliceCookie, "openai-compatible");
+    expect(openaiView.maskedHint).toBe("sk-…abcd");
+    expect(JSON.stringify(openaiView)).not.toContain(OPENAI_API_KEY);
+    const anthropicView = await getConfig(aliceCookie, "anthropic");
+    expect(anthropicView.maskedHint).toBe("sk-…wxyz");
+    expect(JSON.stringify(anthropicView)).not.toContain(ANTHROPIC_API_KEY);
+
+    // Turn 3 after the restart — the new child does not only read, it WRITES:
+    // the anthropic mock still lives in the test process, so the stream runs
+    // to a full contract on the same thread.
+    const turn3 = await postTurn(aliceCookie, {
+      kind: "anthropic",
+      threadId: aliceThreadId,
+      content: turn3Content,
+      clientToken: "tok-mt-three",
+    });
+    assertFullContract(turn3.events, {
+      threadId: aliceThreadId,
+      clientToken: "tok-mt-three",
+      reply: turn2Reply,
+    });
+
+    // Cross-restart transcript: turn 3's request body still carries turn 1's
+    // content — the new child reassembled history written by the old one.
+    const anthropicTurns = apiPosts(anthropicMock.requests, "/v1/messages");
+    expect(anthropicTurns).toHaveLength(2);
+    expect(anthropicTurns[1].body).toContain(turn1Content);
+    expect(anthropicTurns[1].body).toContain(turn3Content);
+
+    // History now holds exactly 6 messages; turn 3 reused the turn-2 mock, so
+    // its assistant text is the turn-2 reply text.
+    const finalHistory = await requestJson(`/api/threads/${aliceThreadId}/messages`, {
+      headers: { cookie: aliceCookie },
+    });
+    expect(finalHistory.status).toBe(200);
+    const finalMessages = finalHistory.body as HistoryMessage[];
+    expect(finalMessages).toHaveLength(6);
+    expect(finalMessages.map((message) => [message.role, message.text])).toEqual([
+      ["user", turn1Content],
+      ["assistant", turn1Reply],
+      ["user", turn2Content],
+      ["assistant", turn2Reply],
+      ["user", turn3Content],
+      ["assistant", turn2Reply],
+    ]);
   }, 60_000);
 });
