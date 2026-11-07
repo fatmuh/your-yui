@@ -8,8 +8,9 @@ memasang dependensi (spine: kewajiban atribusi). File `LICENSE` di dalam
 
 Yui menyematkan engine agent sebagai library di balik satu modul adapter
 (`src/server/engine/`). Paket berikut dan penerbitnya dilisensikan MIT
-(hak cipta Mario Zechner / earendil-works, 2025); teks lisensi lengkap ikut
-terpasang di dalam tarball paket atau repositori hulunya:
+(hak cipta Mario Zechner / earendil-works, 2025). Mayoritas paket membawa
+designasi MIT hanya lewat field `license` di `package.json`; teks lisensi
+lengkap tersedia di repositori hulunya:
 
 | Paket koordinat | Versi | Lisensi |
 | --- | --- | --- |
