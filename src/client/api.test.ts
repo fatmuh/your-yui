@@ -14,6 +14,8 @@ import {
   streamTurn,
   uploadAudioNote,
 } from "./api.ts";
+import { historyToClientMessages } from "./TemplateApp.tsx";
+import type { MessageDto } from "../shared/app.ts";
 import type { ProviderKind, YuiEvent } from "../shared/engine.ts";
 
 // Wrapper API diuji dengan fetch global di-stub (vi.stubGlobal) — tanpa server
@@ -292,6 +294,63 @@ describe("fetchThreadMessages", () => {
       code: "not_found",
       message: "Thread not found.",
     });
+  });
+});
+
+describe("historyToClientMessages", () => {
+  const VOICE_ID = "01JCVOICEVOICEVOICEVOICEVO01";
+
+  it("maps a voice DTO to a playable client message (encoded URL + seconds duration)", () => {
+    const dto: MessageDto = {
+      id: "01JCMESSAGEMESSAGEMESSAGEME03",
+      role: "user",
+      text: "Voice note · 0:42",
+      audio: { id: VOICE_ID, mime: "audio/webm;codecs=opus", durationMs: 42000 },
+      createdAt: "2026-11-07T09:00:00.000Z",
+    };
+
+    const [message] = historyToClientMessages([dto]);
+
+    // id/role/text pass through unchanged, and the DTO's ms duration lands as
+    // client seconds (42000 → 42) with the audio id in the playback URL.
+    expect(message).toEqual({
+      id: dto.id,
+      role: dto.role,
+      text: dto.text,
+      audio: { url: `/api/audio/${VOICE_ID}`, duration: 42 },
+    });
+  });
+
+  it("omits the audio property entirely for a text-only DTO", () => {
+    const dto: MessageDto = {
+      id: "01JCMESSAGEMESSAGEMESSAGEME04",
+      role: "assistant",
+      text: "Here is a first pass.",
+      createdAt: "2026-11-07T09:00:05.000Z",
+    };
+
+    const [message] = historyToClientMessages([dto]);
+
+    expect(message).not.toHaveProperty("audio");
+    expect(message).toEqual({ id: dto.id, role: dto.role, text: dto.text });
+  });
+
+  it("URI-encodes audio ids that contain reserved path characters", () => {
+    const dto: MessageDto = {
+      id: "01JCMESSAGEMESSAGEMESSAGEME05",
+      role: "user",
+      text: "Voice note · 0:03",
+      audio: { id: "ab/cd%ef", mime: "audio/webm", durationMs: 3000 },
+      createdAt: "2026-11-07T09:00:10.000Z",
+    };
+
+    const [message] = historyToClientMessages([dto]);
+
+    expect(message.audio?.url).toBe("/api/audio/ab%2Fcd%25ef");
+  });
+
+  it("returns an empty array for empty history", () => {
+    expect(historyToClientMessages([])).toEqual([]);
   });
 });
 

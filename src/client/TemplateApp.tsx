@@ -16,6 +16,7 @@ import { VoiceNoteControls } from './VoiceNoteControls'
 import { VoiceCall } from './VoiceCall'
 import { useSession } from './SessionContext.tsx'
 import { ApiError, fetchThreadMessages, listThreads, resolveActiveKind, streamTurn, uploadAudioNote } from './api.ts'
+import type { MessageDto } from '../shared/app.ts'
 import type { YuiEvent } from '../shared/engine.ts'
 import './styles.css'
 
@@ -53,6 +54,29 @@ const makeConversation = (): Conversation => ({
     { id: newId(), role: 'assistant', kind: 'choices', text: openingQuestion },
   ],
 })
+
+/**
+ * Map one thread's server history (MessageDto[]) to client Message[] for
+ * loadHistory. Two invariants keep reloaded voice notes playable:
+ * (a) client `audio.duration` is in SECONDS (voiceTime and the aria-label
+ *     consume seconds) — the mirror of the single seconds→milliseconds
+ *     conversion at upload time in sendServerVoiceNote;
+ * (b) `id` passes through UNCHANGED from the DTO — the render keys messages
+ *     by this id, so the stable server id keeps the native <audio> element
+ *     from remounting across re-renders (playback keeps running while the
+ *     thread scrolls).
+ */
+export function historyToClientMessages(messages: MessageDto[]): Message[] {
+  return messages.map(message => {
+    const client: Message = { id: message.id, role: message.role, text: message.text }
+    if (message.audio) {
+      // Relative URL: same-origin as the app, so the session cookie rides the
+      // media request and the owner-scoped GET needs no token in the URL.
+      client.audio = { url: `/api/audio/${encodeURIComponent(message.audio.id)}`, duration: message.audio.durationMs / 1000 }
+    }
+    return client
+  })
+}
 
 function AppIcon({ app }: { app: 'drive' | 'calendar' | 'notion' }) {
   if (app === 'drive') return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#0DA960" d="m9 3-7 12 4 7 7-12z" /><path fill="#FDCB42" d="m9 3 8 0 7 12-8 0z" /><path fill="#4385F5" d="m2 15 14 0 8 0-4 7H6z" /></svg>
@@ -309,7 +333,7 @@ export default function App() {
         setConversations(current => current.map(chat => chat.id === chatId ? {
           ...chat,
           loaded: true,
-          messages: messages.map(message => ({ id: message.id, role: message.role, text: message.text })),
+          messages: historyToClientMessages(messages),
         } : chat))
       })
       .catch((error: unknown) => {
