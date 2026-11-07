@@ -5,8 +5,13 @@
 // respons gagal dilempar sebagai ApiError bermuatan code+message, bukan respons
 // mentah, sehingga AuthPage menampilkan pesan bersih tanpa dump JSON.
 
-import type { MessageDto, ThreadDto, UserDto } from "../shared/app.ts";
-import type { YuiEvent } from "../shared/engine.ts";
+import type {
+  MessageDto,
+  ProviderConfigDto,
+  ThreadDto,
+  UserDto,
+} from "../shared/app.ts";
+import type { ProviderKind, YuiEvent } from "../shared/engine.ts";
 import { createSseParser } from "./sse.ts";
 
 /** User sesi di wire API — turunan kontrak shared (AD-8), bukan definisi lepas. */
@@ -116,11 +121,93 @@ export async function fetchThreadMessages(threadId: string): Promise<MessageDto[
   return (await response.json()) as MessageDto[];
 }
 
+/**
+ * Body for PUT /api/provider-configs/:kind. Upsert semantics: every save
+ * writes a fresh `apiKey` (the server rejects an empty one) — the stored key
+ * is never re-sent by this client.
+ */
+export type PutProviderConfigInput = {
+  apiKey: string;
+  baseUrl?: string;
+  modelId?: string;
+};
+
+/**
+ * GET /api/provider-configs/:kind — the stored masked view (the raw credential
+ * never comes back). Nothing stored yet rejects with ApiError `not_found`.
+ */
+export async function getProviderConfig(
+  kind: ProviderKind,
+): Promise<ProviderConfigDto> {
+  const response = await fetch(`/api/provider-configs/${encodeURIComponent(kind)}`);
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as ProviderConfigDto;
+}
+
+/**
+ * PUT /api/provider-configs/:kind — upsert the one config per (user, kind)
+ * and return the fresh masked view.
+ */
+export async function putProviderConfig(
+  kind: ProviderKind,
+  input: PutProviderConfigInput,
+): Promise<ProviderConfigDto> {
+  const response = await fetch(`/api/provider-configs/${encodeURIComponent(kind)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as ProviderConfigDto;
+}
+
+/**
+ * DELETE /api/provider-configs/:kind — 204 on success; ApiError `not_found`
+ * when nothing is stored for the kind.
+ */
+export async function deleteProviderConfig(kind: ProviderKind): Promise<void> {
+  const response = await fetch(`/api/provider-configs/${encodeURIComponent(kind)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) throw await toApiError(response);
+}
+
+/** GET one kind with the "nothing stored" 404 mapped to null; other failures
+ * (401, network, …) still reject so callers can tell them apart. */
+async function storedConfigOrNull(
+  kind: ProviderKind,
+): Promise<ProviderConfigDto | null> {
+  try {
+    return await getProviderConfig(kind);
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "not_found") return null;
+    throw error;
+  }
+}
+
+/**
+ * Resolve the provider kind the next turn should use: two parallel GETs —
+ * 200 = stored, 404 = not. Prefers "openai-compatible" when both kinds are
+ * stored; null when neither is (the caller then sends the turn without `kind`
+ * and the server default applies). Any other failure propagates.
+ */
+export async function resolveActiveKind(): Promise<ProviderKind | null> {
+  const [openaiCompatible, anthropic] = await Promise.all([
+    storedConfigOrNull("openai-compatible"),
+    storedConfigOrNull("anthropic"),
+  ]);
+  if (openaiCompatible !== null) return "openai-compatible";
+  if (anthropic !== null) return "anthropic";
+  return null;
+}
+
 /** Body for POST /api/engine/turn — omit `threadId` to start a new thread. */
 export type StreamTurnInput = {
   content: string;
   threadId?: string;
   clientToken?: string;
+  /** Provider kind for this turn; omitted lets the server default apply. */
+  kind?: ProviderKind;
 };
 
 /**

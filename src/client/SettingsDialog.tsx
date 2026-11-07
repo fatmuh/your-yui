@@ -1,7 +1,10 @@
-import { useEffect, useState, type KeyboardEvent } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { ChartColumn, Check, Copy, Download, Monitor, Settings, Shield, Vault, X } from 'lucide-react'
 import { SelectMenu } from './SelectMenu'
 import { useAnimatedDialog } from './useAnimatedDialog'
+import { ApiError, deleteProviderConfig, getProviderConfig, putProviderConfig, type PutProviderConfigInput } from './api.ts'
+import { PROVIDER_KINDS, type ProviderKind } from '../shared/engine.ts'
+import type { ProviderConfigDto } from '../shared/app.ts'
 import './settings.css'
 
 const pages = [
@@ -14,10 +17,9 @@ const pages = [
 ] as const
 type Page = typeof pages[number]['id']
 
-const localPages: Record<Exclude<Page, 'general'>, string> = {
+const localPages: Record<Exclude<Page, 'general' | 'vault'>, string> = {
   computer: 'Computer is not connected. This page does not control a machine, and files stay in this chat.',
   permissions: 'Permissions are not connected. This page does not grant access to apps or accounts.',
-  vault: 'Vault is not connected. Nothing here is stored outside this browser, and chats reset when you reload.',
   billing: 'Usage and billing are not connected. The 8% used label in the workspace menu is sample data, and this page cannot charge you.',
   updates: 'Updates are not connected. This page does not download or install software.',
 }
@@ -114,7 +116,7 @@ export function SettingsDialog({ open, onClose, spellCheck, onSpellCheck }: Prop
         <div id="settings-panel" role="tabpanel" aria-labelledby={`settings-tab-${page}`} tabIndex={page === 'general' ? undefined : 0} className="settings-scroll">
           <h2 id="settings-title">{current.label}</h2>
           <p id="settings-status" role="status" className={status ? 'settings-status' : 'sr-only'}>{status}</p>
-          {page === 'general' ? <GeneralPage theme={theme} accent={accent} language={language} spellCheck={spellCheck} copied={copied} onTheme={setTheme} onAccent={setAccent} onLanguage={setLanguage} onSpellCheck={onSpellCheck} onCopy={() => void copyEmail()} onStarted={() => setStatus('Subscriptions are not connected. Get started does not start a purchase.')} onAccount={() => setStatus('Adding an account is not connected. This demo keeps one local workspace.')} onSignOut={() => setStatus('Log out is not connected. This local chat stays open.')} /> : <p className="settings-note">{localPages[page]}</p>}
+          {page === 'general' ? <GeneralPage theme={theme} accent={accent} language={language} spellCheck={spellCheck} copied={copied} onTheme={setTheme} onAccent={setAccent} onLanguage={setLanguage} onSpellCheck={onSpellCheck} onCopy={() => void copyEmail()} onStarted={() => setStatus('Subscriptions are not connected. Get started does not start a purchase.')} onAccount={() => setStatus('Adding an account is not connected. This demo keeps one local workspace.')} onSignOut={() => setStatus('Log out is not connected. This local chat stays open.')} /> : page === 'vault' ? <VaultPage onStatus={setStatus} /> : <p className="settings-note">{localPages[page]}</p>}
         </div>
       </div>
     </div>
@@ -187,4 +189,154 @@ function SelectRow({ label, value, options, onChange }: { label: string; value: 
     <label id={`${id}-label`} htmlFor={id}>{label}</label>
     <SelectMenu id={id} labelledBy={`${id}-label`} variant="settings" value={value} options={options} onChange={onChange} />
   </div>
+}
+
+/** Editable fields for one provider kind; the API key is never pre-filled. */
+type VaultForm = { baseUrl: string; modelId: string; apiKey: string }
+
+const EMPTY_VAULT_FORM: Record<ProviderKind, VaultForm> = {
+  'openai-compatible': { baseUrl: '', modelId: '', apiKey: '' },
+  anthropic: { baseUrl: '', modelId: '', apiKey: '' },
+}
+
+/** SelectMenu options derived from the shared kind list — one source (AD-8). */
+const KIND_OPTIONS = PROVIDER_KINDS.map(kind => ({ value: kind, label: kind === 'openai-compatible' ? 'OpenAI-compatible' : 'Anthropic' }))
+
+/** Map a failed request to a status message: 401 everywhere means the session
+ * expired; other envelopes carry their own safe message; anything else is
+ * network-level and gets the fallback. */
+function vaultStatusMessage(fallback: string, error: unknown): string {
+  if (error instanceof ApiError && error.code === 'unauthorized') return 'Session expired. Sign in again.'
+  return error instanceof ApiError ? error.message : fallback
+}
+
+function VaultPage({ onStatus }: { onStatus: (message: string) => void }) {
+  const [kind, setKind] = useState<ProviderKind>('openai-compatible')
+  const [stored, setStored] = useState<Record<ProviderKind, ProviderConfigDto | null>>({ 'openai-compatible': null, anthropic: null })
+  const [form, setForm] = useState<Record<ProviderKind, VaultForm>>(() => ({ ...EMPTY_VAULT_FORM }))
+  const [busy, setBusy] = useState(false)
+  // Kinds the user has edited or whose state a completed Save/Remove already
+  // wrote: a slow in-flight GET must not wipe that draft or clobber the write.
+  const dirty = useRef<Set<ProviderKind>>(new Set())
+  const current = form[kind]
+  const storedHere = stored[kind]
+
+  // Load both kinds when the Vault page opens: 200 → stored, 404 → nothing yet
+  // (normal, not an error). The stored key itself never comes back — only its
+  // maskedHint — so the API key field always starts empty.
+  useEffect(() => {
+    let cancelled = false
+    for (const eachKind of PROVIDER_KINDS) {
+      getProviderConfig(eachKind)
+        .then(config => {
+          if (cancelled) return
+          // Freeze the view once the user edited this kind or a write landed;
+          // the stored-key hint self-heals next time the page opens.
+          if (dirty.current.has(eachKind)) return
+          setStored(current => ({ ...current, [eachKind]: config }))
+          setForm(current => ({ ...current, [eachKind]: { baseUrl: config.baseUrl ?? '', modelId: config.modelId ?? '', apiKey: '' } }))
+        })
+        .catch((error: unknown) => {
+          if (cancelled) return
+          if (error instanceof ApiError && error.code === 'not_found') return
+          onStatus(vaultStatusMessage('Could not load the stored provider configuration.', error))
+        })
+    }
+    return () => { cancelled = true }
+  }, [onStatus])
+
+  function updateField(field: keyof VaultForm, value: string) {
+    dirty.current.add(kind)
+    setForm(current => ({ ...current, [kind]: { ...current[kind], [field]: value } }))
+  }
+
+  async function save() {
+    // Minimal client-side validation; the server re-validates and its envelope
+    // message lands in the same status region.
+    if (!current.apiKey.trim()) {
+      onStatus('Enter the API key to save.')
+      return
+    }
+    if (kind === 'openai-compatible' && !current.baseUrl.trim()) {
+      onStatus('Enter the Base URL to save.')
+      return
+    }
+    if (kind === 'openai-compatible' && !current.modelId.trim()) {
+      onStatus('Enter the model to save.')
+      return
+    }
+    const body: PutProviderConfigInput = { apiKey: current.apiKey.trim() }
+    if (kind === 'openai-compatible') {
+      body.baseUrl = current.baseUrl.trim()
+      body.modelId = current.modelId.trim()
+    } else if (storedHere !== null) {
+      // The server PUT is a full replace: absent fields are stored as null.
+      // This form does not manage anthropic's baseUrl/modelId, so forward
+      // whatever is stored to keep values provisioned via the API directly.
+      if (storedHere.baseUrl !== null) body.baseUrl = storedHere.baseUrl
+      if (storedHere.modelId !== null) body.modelId = storedHere.modelId
+    }
+    setBusy(true)
+    try {
+      // Upsert: every save sends a fresh key; the response is the new masked view.
+      const config = await putProviderConfig(kind, body)
+      dirty.current.add(kind)
+      setStored(current => ({ ...current, [kind]: config }))
+      setForm(current => ({ ...current, [kind]: { baseUrl: config.baseUrl ?? '', modelId: config.modelId ?? '', apiKey: '' } }))
+      onStatus(`Saved. Stored key ${config.maskedHint}.`)
+    } catch (error) {
+      onStatus(vaultStatusMessage('Could not save the configuration. Try again.', error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function remove() {
+    setBusy(true)
+    try {
+      await deleteProviderConfig(kind)
+      dirty.current.add(kind)
+      setStored(current => ({ ...current, [kind]: null }))
+      setForm(current => ({ ...current, [kind]: { ...EMPTY_VAULT_FORM[kind] } }))
+      onStatus('Removed.')
+    } catch (error) {
+      onStatus(vaultStatusMessage('Could not remove the configuration. Try again.', error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const kindMenuId = 'settings-provider-kind'
+  return <>
+    <h3 className="settings-section">Provider</h3>
+    <section className="settings-card settings-appearance" aria-label="Provider configuration">
+      <div className="settings-row">
+        <label id={`${kindMenuId}-label`} htmlFor={kindMenuId}>Provider</label>
+        <SelectMenu id={kindMenuId} labelledBy={`${kindMenuId}-label`} variant="settings" value={kind} options={KIND_OPTIONS} onChange={value => setKind(value as ProviderKind)} />
+      </div>
+      {kind === 'openai-compatible' && <>
+        <FieldRow id="settings-provider-base-url" label="Base URL" placeholder="https://api.example.com/v1" value={current.baseUrl} onChange={value => updateField('baseUrl', value)} />
+        <FieldRow id="settings-provider-model" label="Model" placeholder="gpt-4o-mini" value={current.modelId} onChange={value => updateField('modelId', value)} />
+      </>}
+      <label className="settings-row" htmlFor="settings-provider-api-key">
+        <span>API key</span>
+        <input id="settings-provider-api-key" type="password" autoComplete="new-password" placeholder={storedHere ? `Enter a new key to replace ${storedHere.maskedHint}` : 'Enter the API key'} value={current.apiKey} onChange={event => updateField('apiKey', event.target.value)} />
+      </label>
+      <div className="settings-row">
+        <span>{storedHere ? <>Stored key <bdi>{storedHere.maskedHint}</bdi></> : 'No key stored yet.'}</span>
+        <span className="settings-account-actions">
+          <button type="button" className="settings-pill" disabled={busy} onClick={() => void save()}>Save</button>
+          {storedHere !== null && <button type="button" className="settings-pill" disabled={busy} onClick={() => void remove()}>Remove</button>}
+        </span>
+      </div>
+      <p className="sr-only">Saving always stores the key you just typed over the previous one. The stored key is never sent back to this page — only its masked hint is shown.</p>
+    </section>
+  </>
+}
+
+function FieldRow({ id, label, placeholder, value, onChange }: { id: string; label: string; placeholder: string; value: string; onChange: (value: string) => void }) {
+  return <label className="settings-row" htmlFor={id}>
+    <span>{label}</span>
+    <input id={id} type="text" placeholder={placeholder} value={value} onChange={event => onChange(event.target.value)} />
+  </label>
 }

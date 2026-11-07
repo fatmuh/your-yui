@@ -15,7 +15,7 @@ import { useVoiceRecorder, voiceTime, type VoiceNote } from './useVoiceRecorder'
 import { VoiceNoteControls } from './VoiceNoteControls'
 import { VoiceCall } from './VoiceCall'
 import { useSession } from './SessionContext.tsx'
-import { ApiError, fetchThreadMessages, listThreads, streamTurn } from './api.ts'
+import { ApiError, fetchThreadMessages, listThreads, resolveActiveKind, streamTurn } from './api.ts'
 import type { YuiEvent } from '../shared/engine.ts'
 import './styles.css'
 
@@ -437,7 +437,13 @@ export default function App() {
     setDraft('')
     setFiles([])
     setTypingId(chatId)
-    void streamTurn({ content: text, threadId: turn.threadId, clientToken: newId() }, event => applyTurnEvent(turn, event))
+    // The active kind resolves per-send (two parallel GETs), so a config saved
+    // moments ago in Settings applies to this turn without a reload. Resolution
+    // failure never blocks the turn: it goes out without `kind` and the server's
+    // own response tells the story.
+    void resolveActiveKind()
+      .catch(() => null)
+      .then(kind => streamTurn({ content: text, threadId: turn.threadId, clientToken: newId(), kind: kind ?? undefined }, event => applyTurnEvent(turn, event)))
       .catch((error: unknown) => {
         // Pre-stream rejection or mid-stream failure: release the composer and
         // surface a notice — turn-scoped, so a stale turn's rejection cannot

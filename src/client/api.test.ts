@@ -1,15 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  deleteProviderConfig,
   fetchMe,
   fetchThreadMessages,
+  getProviderConfig,
   listThreads,
   loginUser,
   logoutUser,
+  putProviderConfig,
   registerUser,
+  resolveActiveKind,
   streamTurn,
 } from "./api.ts";
-import type { YuiEvent } from "../shared/engine.ts";
+import type { ProviderKind, YuiEvent } from "../shared/engine.ts";
 
 // Wrapper API diuji dengan fetch global di-stub (vi.stubGlobal) — tanpa server
 // dan tanpa deps test baru. Response global Node dipakai untuk membangun
@@ -30,6 +34,20 @@ function jsonResponse(body: unknown, status = 200): Response {
 function stubFetch(response: Response): ReturnType<typeof vi.fn> {
   const mock = vi.fn();
   mock.mockResolvedValue(response);
+  vi.stubGlobal("fetch", mock);
+  return mock;
+}
+
+/**
+ * Stub fetch global with one response per URL — for tests that fire parallel
+ * GETs (resolveActiveKind). Each response is consumed exactly once.
+ */
+function stubFetchByUrl(routes: Record<string, Response>): ReturnType<typeof vi.fn> {
+  const mock = vi.fn((url: string) => {
+    const response = routes[url];
+    if (response === undefined) throw new Error(`Unexpected fetch URL: ${url}`);
+    return Promise.resolve(response);
+  });
   vi.stubGlobal("fetch", mock);
   return mock;
 }
@@ -276,6 +294,173 @@ describe("fetchThreadMessages", () => {
   });
 });
 
+const OPENAI_CONFIG_DTO = {
+  kind: "openai-compatible",
+  baseUrl: "https://api.example.com/v1",
+  modelId: "gpt-test",
+  maskedHint: "sk-…abcd",
+  createdAt: "2026-11-07T09:00:00.000Z",
+  updatedAt: "2026-11-07T09:00:00.000Z",
+};
+
+const ANTHROPIC_CONFIG_DTO = {
+  kind: "anthropic",
+  baseUrl: null,
+  modelId: null,
+  maskedHint: "sk-…wxyz",
+  createdAt: "2026-11-07T09:10:00.000Z",
+  updatedAt: "2026-11-07T09:10:00.000Z",
+};
+
+/** Fresh 404 envelope per call — a Response body can only be read once, so a
+ * shared const would break every test after its first consumer. */
+function notStoredResponse(): Response {
+  return jsonResponse(
+    { error: { code: "not_found", message: "No provider configuration is stored for this kind." } },
+    404,
+  );
+}
+
+describe("getProviderConfig", () => {
+  it("calls GET /api/provider-configs/:kind and returns the ProviderConfigDto unchanged", async () => {
+    const mock = stubFetch(jsonResponse(OPENAI_CONFIG_DTO));
+
+    await expect(getProviderConfig("openai-compatible")).resolves.toEqual(OPENAI_CONFIG_DTO);
+    // GET without init — the session cookie rides the same-origin default.
+    expect(mock).toHaveBeenCalledWith("/api/provider-configs/openai-compatible");
+  });
+
+  it("404 envelope when nothing is stored → ApiError not_found", async () => {
+    stubFetch(notStoredResponse());
+
+    await expect(getProviderConfig("anthropic")).rejects.toMatchObject({
+      name: "ApiError",
+      code: "not_found",
+      message: "No provider configuration is stored for this kind.",
+    });
+  });
+});
+
+describe("putProviderConfig", () => {
+  it("sends PUT with the config body and returns the masked view", async () => {
+    const mock = stubFetch(jsonResponse(OPENAI_CONFIG_DTO));
+
+    const config = await putProviderConfig("openai-compatible", {
+      apiKey: "sk-live-openai-1111aaaa",
+      baseUrl: "https://api.example.com/v1",
+      modelId: "gpt-test",
+    });
+
+    expect(config).toEqual(OPENAI_CONFIG_DTO);
+    const [url, init] = firstCall(mock);
+    expect(url).toBe("/api/provider-configs/openai-compatible");
+    expect(init.method).toBe("PUT");
+    expect(init.headers).toMatchObject({ "content-type": "application/json" });
+    expect(JSON.parse(String(init.body))).toEqual({
+      apiKey: "sk-live-openai-1111aaaa",
+      baseUrl: "https://api.example.com/v1",
+      modelId: "gpt-test",
+    });
+  });
+
+  it("omits absent optional fields from the JSON body (anthropic key-only save)", async () => {
+    const mock = stubFetch(jsonResponse(ANTHROPIC_CONFIG_DTO));
+
+    await putProviderConfig("anthropic", { apiKey: "sk-live-anthropic-2222bbbb" });
+
+    const [url, init] = firstCall(mock);
+    expect(url).toBe("/api/provider-configs/anthropic");
+    expect(JSON.parse(String(init.body))).toStrictEqual({ apiKey: "sk-live-anthropic-2222bbbb" });
+  });
+
+  it("400 invalid_request envelope → ApiError with the server message", async () => {
+    stubFetch(
+      jsonResponse(
+        { error: { code: "invalid_request", message: 'Provider kind "openai-compatible" requires both "baseUrl" and "modelId".' } },
+        400,
+      ),
+    );
+
+    await expect(
+      putProviderConfig("openai-compatible", { apiKey: "sk-live-openai-1111aaaa" }),
+    ).rejects.toMatchObject({
+      name: "ApiError",
+      code: "invalid_request",
+      message: 'Provider kind "openai-compatible" requires both "baseUrl" and "modelId".',
+    });
+  });
+});
+
+describe("deleteProviderConfig", () => {
+  it("sends DELETE and resolves on 204", async () => {
+    const mock = stubFetch(new Response(null, { status: 204 }));
+
+    await expect(deleteProviderConfig("anthropic")).resolves.toBeUndefined();
+
+    const [url, init] = firstCall(mock);
+    expect(url).toBe("/api/provider-configs/anthropic");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("404 envelope when nothing is stored → ApiError not_found", async () => {
+    stubFetch(notStoredResponse());
+
+    await expect(deleteProviderConfig("openai-compatible")).rejects.toMatchObject({
+      name: "ApiError",
+      code: "not_found",
+      message: "No provider configuration is stored for this kind.",
+    });
+  });
+});
+
+describe("resolveActiveKind", () => {
+  it("prefers openai-compatible when both kinds are stored", async () => {
+    const mock = stubFetchByUrl({
+      "/api/provider-configs/openai-compatible": jsonResponse(OPENAI_CONFIG_DTO),
+      "/api/provider-configs/anthropic": jsonResponse(ANTHROPIC_CONFIG_DTO),
+    });
+
+    await expect(resolveActiveKind()).resolves.toBe("openai-compatible");
+    // Two parallel GETs — one per kind.
+    expect(mock).toHaveBeenCalledWith("/api/provider-configs/openai-compatible");
+    expect(mock).toHaveBeenCalledWith("/api/provider-configs/anthropic");
+  });
+
+  it("returns anthropic when only anthropic is stored", async () => {
+    stubFetchByUrl({
+      "/api/provider-configs/openai-compatible": notStoredResponse(),
+      "/api/provider-configs/anthropic": jsonResponse(ANTHROPIC_CONFIG_DTO),
+    });
+
+    await expect(resolveActiveKind()).resolves.toBe("anthropic");
+  });
+
+  it("returns null when neither kind is stored", async () => {
+    stubFetchByUrl({
+      "/api/provider-configs/openai-compatible": notStoredResponse(),
+      "/api/provider-configs/anthropic": notStoredResponse(),
+    });
+
+    await expect(resolveActiveKind()).resolves.toBeNull();
+  });
+
+  it("propagates a failure other than not_found (401 unauthorized)", async () => {
+    stubFetchByUrl({
+      "/api/provider-configs/openai-compatible": jsonResponse(
+        { error: { code: "unauthorized", message: "A valid session is required." } },
+        401,
+      ),
+      "/api/provider-configs/anthropic": notStoredResponse(),
+    });
+
+    await expect(resolveActiveKind()).rejects.toMatchObject({
+      name: "ApiError",
+      code: "unauthorized",
+      message: "A valid session is required.",
+    });
+  });
+});
+
 describe("streamTurn", () => {
   it("posts {content,clientToken} with no threadId key for a new thread and dispatches events in stream order", async () => {
     const mock = stubFetch(
@@ -353,6 +538,30 @@ describe("streamTurn", () => {
 
     const [, init] = firstCall(mock);
     expect(JSON.parse(String(init.body))).toStrictEqual({
+      content: "Next turn",
+      threadId: THREAD_A,
+    });
+  });
+
+  it("includes kind in the JSON body when a provider kind is given, and drops it when null resolves", async () => {
+    const mock = stubFetch(sseResponse([sseFrame("turn.settled", { threadId: THREAD_A })]));
+
+    await streamTurn({ content: "Next turn", threadId: THREAD_A, kind: "anthropic" }, () => undefined);
+
+    const [, init] = firstCall(mock);
+    expect(JSON.parse(String(init.body))).toStrictEqual({
+      content: "Next turn",
+      threadId: THREAD_A,
+      kind: "anthropic",
+    });
+
+    const nullKind = stubFetch(sseResponse([sseFrame("turn.settled", { threadId: THREAD_A })]));
+    // Mirrors the production call in sendServerMessage: kind ?? undefined —
+    // the serializer must drop the key, never emit "kind": null.
+    const resolved: ProviderKind | null = null;
+    await streamTurn({ content: "Next turn", threadId: THREAD_A, kind: resolved ?? undefined }, () => undefined);
+    const [, secondInit] = firstCall(nullKind);
+    expect(JSON.parse(String(secondInit.body))).toStrictEqual({
       content: "Next turn",
       threadId: THREAD_A,
     });
