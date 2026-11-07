@@ -83,6 +83,10 @@ async function spawnServed(port: number): Promise<ChildProcess> {
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      // Jangan bocorkan anak proses hidup: boot mungkin saja hanya lambat
+      // (runner CI sesak) — bunuh pasti SEBELUM reject (exit-handler sudah
+      // di-guard `settled`, jadi tak ada double-settle).
+      spawned.kill("SIGKILL");
       reject(
         new Error(
           `anak proses tak mengumumkan "${marker}" dalam 30 detik\n--- stdout+stderr anak ---\n${childOutput}`,
@@ -303,6 +307,11 @@ beforeAll(async () => {
 afterAll(async () => {
   if (child !== null) {
     await stopChild(child);
+    // Anak sudah exit dan seluruh outputnya tertangkap — audit ulang R2 agar
+    // kebocoran kunci SETELAH test terakhir (mis. log saat shutdown/SIGTERM)
+    // pun memerahkan suite, bukan lolos tanpa diperiksa.
+    expect(childOutput).not.toContain(OPENAI_API_KEY);
+    expect(childOutput).not.toContain(ANTHROPIC_API_KEY);
   }
   while (openMocks.length > 0) {
     await openMocks.pop()?.close();
