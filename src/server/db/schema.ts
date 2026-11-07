@@ -1,5 +1,5 @@
-import { type InferSelectModel } from "drizzle-orm";
-import { blob, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { type InferSelectModel, sql } from "drizzle-orm";
+import { blob, check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 // Fondasi Yui (AD-6): hanya `users` dan `auth_sessions`. Tabel epik lain
 // (provider_configs, threads, messages, audio_blobs) dimigrasi epik pemiliknya.
@@ -53,6 +53,50 @@ export const providerConfigs = sqliteTable(
   (table) => [uniqueIndex("provider_configs_user_id_kind_unique").on(table.userId, table.kind)],
 );
 
+// epic-percakapan (R2, AD-5, AD-6): `threads` + `messages` — riwayat percakapan
+// per pengguna. Server adalah penulis tunggal (route giliran, story 3); cerita
+// ini hanya membaca. `threads.title` DEFAULT '' — kolom disiapkan untuk daftar;
+// pengisian judul sungguhan (turunan pesan user pertama) = keputusan story 3.
+
+export const threads = sqliteTable(
+  "threads",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    title: text("title").notNull().default(""),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [index("threads_user_id_updated_at_index").on(table.userId, table.updatedAt)],
+);
+
+// `role` menyimpan nilai `MessageRole` kontrak shared — selaras tipe Message
+// template client ('user' | 'assistant'); tanpa kolom spekulatif di luar R2
+// (token/kind/audio menyusul story 3+ bila dibutuhkan). Nilai dijaga CHECK
+// constraint di DB — kolom TEXT mentah tanpa check akan menerima apa pun dan
+// lolos ke wire lewat cast di route.
+
+export const messages = sqliteTable(
+  "messages",
+  {
+    id: text("id").primaryKey(),
+    threadId: text("thread_id")
+      .notNull()
+      .references(() => threads.id, { onDelete: "cascade" }),
+    role: text("role").notNull(),
+    text: text("text").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    index("messages_thread_id_created_at_index").on(table.threadId, table.createdAt),
+    check("messages_role_check", sql`${table.role} IN ('user', 'assistant')`),
+  ],
+);
+
 export type User = InferSelectModel<typeof users>;
 export type AuthSession = InferSelectModel<typeof authSessions>;
 export type ProviderConfig = InferSelectModel<typeof providerConfigs>;
+export type Thread = InferSelectModel<typeof threads>;
+export type Message = InferSelectModel<typeof messages>;

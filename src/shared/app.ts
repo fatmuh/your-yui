@@ -45,3 +45,36 @@ export type ProviderConfigDto = {
   /** ISO-8601 UTC. */
   updatedAt: string;
 };
+
+/**
+ * Peran pesan percakapan — selaras tipe Message template client
+ * ('user' | 'assistant'); disimpan apa adanya di kolom `messages.role`.
+ */
+export type MessageRole = "user" | "assistant";
+
+/**
+ * Thread DTO on the API wire (AD-8): GET /api/threads returns ThreadDto[]
+ * (updatedAt desc). `title` defaults to '' until story 3 (server-side writer)
+ * derives it from the first user message.
+ * Timestamps are ISO-8601 UTC (DB stores epoch-ms; converted at the edge).
+ */
+export type ThreadDto = {
+  id: string;
+  title: string;
+  /** ISO-8601 UTC. */
+  createdAt: string;
+  /** ISO-8601 UTC. */
+  updatedAt: string;
+};
+
+/**
+ * Message DTO on the API wire (AD-8): GET /api/threads/:id/messages returns
+ * MessageDto[] (createdAt asc). The client consumes it in story 4.
+ */
+export type MessageDto = {
+  id: string;
+  role: MessageRole;
+  text: string;
+  /** ISO-8601 UTC (DB stores epoch-ms; converted at the edge). */
+  createdAt: string;
+};
