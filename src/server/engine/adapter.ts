@@ -7,9 +7,15 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+// AD-1 keeps this the only module naming the engine package. `tools.ts` (the
+// custom-tool definitions the adapter wires in) consumes the engine's tool
+// type through this type-only re-export, so the package name appears nowhere
+// else in the repo.
+export type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { YuiDatabase } from "../db/index.ts";
 import { getProviderConfigById } from "../providers/store.ts";
 import { CryptoError, decryptSecret, loadEncryptionKey, maskSecret } from "../providers/crypto.ts";
+import { createYuiTools, YUI_TOOL_NAMES } from "./tools.ts";
 import type {
   EngineAdapter,
   EngineCreateSessionInput,
@@ -115,6 +121,31 @@ function assistantText(content: Array<{ type: string; text?: string }>): string 
     .join("");
 }
 
+/** Detail cap for tool events (Design Notes: a summary of at most 200 chars). */
+const TOOL_DETAIL_MAX_CHARS = 200;
+
+/** `tool.activity` detail for a start: the URL the model asked for, when the args carry one. */
+function toolStartDetail(args: unknown): string | undefined {
+  if (typeof args === "object" && args !== null && typeof (args as { url?: unknown }).url === "string") {
+    return (args as { url: string }).url.replace(/\s+/g, " ").trim().slice(0, TOOL_DETAIL_MAX_CHARS);
+  }
+  return undefined;
+}
+
+/** `tool.activity` detail for an end: the result's text (guard reason on error), else the duration. */
+function toolEndDetail(result: unknown, isError: boolean, durationMs: number | undefined): string | undefined {
+  if (isError) {
+    const blocks =
+      typeof result === "object" && result !== null && Array.isArray((result as { content?: unknown }).content)
+        ? (result as { content: Array<{ type: string; text?: unknown }> }).content
+        : [];
+    const textBlock = blocks.find((block) => block.type === "text" && typeof block.text === "string");
+    const line = (typeof textBlock?.text === "string" ? textBlock.text : "").replace(/\s+/g, " ").trim();
+    if (line.length > 0) return line.slice(0, TOOL_DETAIL_MAX_CHARS);
+  }
+  return durationMs === undefined ? "done" : `${durationMs}ms`;
+}
+
 /** Satu baris, tanpa kredensial: bentuk aman untuk payload error AD-4. */
 function sanitizeMessage(message: string, secrets: string[]): string {
   let safe = message.replace(/\s+/g, " ").trim().slice(0, 300);
@@ -206,7 +237,10 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
             [entry.providerId]: {
               api: entry.api,
               baseUrl: entry.baseUrl,
-              models: [{ id: entry.modelId }],
+              // `input` must include "image": the engine defaults it to
+              // ["text"] and then silently swaps user images for an
+              // "(image omitted...)" placeholder on non-vision models.
+              models: [{ id: entry.modelId, input: ["text", "image"] }],
             },
           },
         }),
@@ -257,24 +291,40 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
         model,
         modelRuntime: runtime,
         sessionManager: SessionManager.inMemory(tempDir),
-        noTools: "all",
+        // AD-7 revision (bot tool calling): built-in coding tools stay OFF —
+        // only the two custom fetch tools from ./tools.ts are registered.
+        noTools: "builtin",
+        customTools: createYuiTools(),
         agentDir: tempDir,
       });
 
-      // AD-7: set tool HARUS kosong — assert, bukan asumsi.
-      if (session.getActiveToolNames().length > 0) {
-        fail("engine_setup_failed", "Engine session came up with active tools; refusing to run.");
+      // Two-layer allowlist, layer 1 — assert, don't assume: the ACTIVE set
+      // must be exactly {web_fetch, view_image}. Anything else active (a
+      // built-in that survived, an extension tool) refuses the whole turn.
+      const activeTools = [...session.getActiveToolNames()].sort().join(",");
+      const expectedTools = [...YUI_TOOL_NAMES].sort().join(",");
+      if (activeTools !== expectedTools) {
+        fail(
+          "engine_setup_failed",
+          `Engine session came up with tools [${activeTools}]; refusing to run (expected [${expectedTools}]).`,
+        );
         return;
       }
-      // Pertahanan defensif bila tool tiba-tiba aktif di masa depan: blokir total.
-      session.agent.beforeToolCall = async () => ({
-        block: true,
-        terminate: true,
-        reason: "Yui v1 runs with tools disabled.",
-      });
+      // Layer 2 — deny-only hook: allowlisted names pass, ANY other name is
+      // blocked with an error result (the model sees the reason and continues).
+      session.agent.beforeToolCall = async ({ toolCall }) => {
+        if ((YUI_TOOL_NAMES as readonly string[]).includes(toolCall.name)) {
+          return undefined;
+        }
+        return { block: true, reason: `Tool "${toolCall.name}" is not allowed.` };
+      };
 
       const messageId = ulid();
       let cumulative = "";
+      // Per-hop texts: each provider response of the turn contributes its own
+      // entry; the FINAL assembly joins them with a paragraph break instead of
+      // jamming them together.
+      const hopTexts: string[] = [];
       session.subscribe((event) => {
         if (
           event.type === "message_update" &&
@@ -303,23 +353,64 @@ export function createEngineAdapter(db: YuiDatabase): EngineAdapter {
               code: "provider_error",
               message: sanitizeMessage(raw, [apiKey]),
             });
+          } else if (event.message.stopReason === "toolUse") {
+            // Tool-call turn, intermediate assistant message: the loop is about
+            // to execute tools and call the provider again — this is NOT the
+            // turn's final message, so no `message.final` here (tool activity
+            // events stream in its place; the real final follows the last hop).
+            hopTexts.push(assistantText(event.message.content));
+            return;
           } else {
+            hopTexts.push(assistantText(event.message.content));
+            // Hop texts joined, not jammed: a narrating tool turn streams a
+            // preamble hop ("Let me check that.") followed by the answer hop —
+            // the persisted final keeps both, separated by a paragraph break.
+            // (Streaming deltas stay cumulative by design.)
+            const joined = hopTexts.filter((text) => text.length > 0).join("\n\n");
             emit({
               type: "message.final",
               threadId,
               messageId,
               role: "assistant",
               clientToken: input.clientToken,
-              text: assistantText(event.message.content) || cumulative,
+              text: joined,
             });
           }
+        } else if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+          // Tool activity (AD-4 extension): transient, pre-settle, ≤200-char
+          // sanitized detail — the URL on start, the outcome text on end.
+          // Page/image bodies NEVER flow here (only guard reasons and sizes).
+          const detail =
+            event.type === "tool_execution_start"
+              ? toolStartDetail(event.args)
+              : toolEndDetail(event.result, event.isError, event.durationMs);
+          emit({
+            type: "tool.activity",
+            threadId,
+            tool: event.toolName,
+            phase: event.type === "tool_execution_start" ? "start" : "end",
+            ...(detail === undefined ? {} : { detail }),
+            ...(event.type === "tool_execution_end" && event.isError ? { isError: true } : {}),
+          });
         } else if (event.type === "agent_settled") {
           settle();
         }
       });
 
       try {
-        await session.prompt(input.content);
+        // Multimodal turn: engine-native image content is built HERE (AD-1 —
+        // the engine's types never leak past this module).
+        const promptOptions =
+          input.images === undefined || input.images.length === 0
+            ? undefined
+            : {
+                images: input.images.map((image) => ({
+                  type: "image" as const,
+                  data: image.data,
+                  mimeType: image.mimeType,
+                })),
+              };
+        await session.prompt(input.content, promptOptions);
       } catch (error) {
         const raw = error instanceof Error ? error.message : "The turn failed.";
         emit({ type: "error", threadId, code: "turn_failed", message: sanitizeMessage(raw, [apiKey]) });

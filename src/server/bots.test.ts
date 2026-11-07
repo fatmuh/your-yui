@@ -539,15 +539,20 @@ describe("migration 0005 — backfill over a live 0004 database", () => {
       expect(thread.botId).toBe(`backfill-yui-${thread.userId}`);
     }
 
-    // Ledger: exactly one row was added (0005), and re-running is a no-op.
+    // Ledger: the remaining migrations were appended after the seeded 0004 row
+    // (0005 bots + 0006 images), and re-running is a no-op.
     const ledger = db.$client
       .prepare("SELECT hash, created_at FROM __drizzle_migrations ORDER BY created_at")
       .all() as Array<{ hash: string; created_at: number }>;
-    expect(ledger).toHaveLength(2);
+    expect(ledger).toHaveLength(3);
     const appliedHash = createHash("sha256")
       .update(readFileSync(join(migrationsFolder, "0005_wakeful_maverick.sql"), "utf8"))
       .digest("hex");
     expect(ledger[1]).toEqual({ hash: appliedHash, created_at: 1_794_043_895_136 });
+    const imageHash = createHash("sha256")
+      .update(readFileSync(join(migrationsFolder, "0006_bright_annihilus.sql"), "utf8"))
+      .digest("hex");
+    expect(ledger[2].hash).toBe(imageHash);
     expect(() => migrateDatabase(db)).not.toThrow();
     expect(db.select().from(bots).all()).toHaveLength(2);
   });

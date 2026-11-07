@@ -54,6 +54,21 @@ export type EnginePromptInput = {
   persona: string;
   /** Token dari POST klien; dibawa balik di `message.final` untuk dedup pesan optimistik. */
   clientToken?: string;
+  /**
+   * Images attached to this turn's prompt (multimodal, bot-tool-calling epic):
+   * base64 bytes + mime, referenced from user-uploaded blobs by the engine
+   * route. Converted to the engine's native image content inside the adapter
+   * (AD-1) — this shape stays engine-agnostic. Omitted/empty = text-only turn.
+   */
+  images?: EngineImageInput[];
+};
+
+/** One attached image on `EnginePromptInput.images`. */
+export type EngineImageInput = {
+  /** Base64-encoded image bytes (no `data:` URL prefix). */
+  data: string;
+  /** Image mime type, e.g. "image/png". */
+  mimeType: string;
 };
 
 /**
@@ -90,6 +105,24 @@ export type YuiEvent =
   | {
       type: "turn.settled";
       threadId: string;
+    }
+  | {
+      /**
+       * Transient tool activity (AD-4 extension, bot-tool-calling epic): the
+       * allowlisted custom tools (`web_fetch`, `view_image`) reporting progress.
+       * Never persisted; always flows BEFORE `turn.settled` of its turn; the
+       * client renders it as a transient chip and clears it on settle.
+       */
+      type: "tool.activity";
+      threadId: string;
+      /** Tool name from the two-tool allowlist. */
+      tool: string;
+      /** "start" before execution, "end" when the result is in. */
+      phase: "start" | "end";
+      /** One-line summary ≤200 chars (URL / block reason) — never page bodies. */
+      detail?: string;
+      /** Present on `end` when the tool result is an error. */
+      isError?: boolean;
     }
   | {
       type: "error";

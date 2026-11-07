@@ -58,12 +58,14 @@ describe("migrasi schema dasar", () => {
     // Foundation tables (users, auth_sessions) + provider epic tables
     // (provider_configs) + conversation epic tables (threads, messages) +
     // voice epic table (audio_blobs, upload/playback API) + multi-bot table
-    // (bots, 0005) + drizzle internal.
+    // (bots, 0005) + image blobs (image_blobs, messages.image_ids — 0006,
+    // bot tool calling) + drizzle internal.
     expect(tableNames(file)).toEqual([
       "__drizzle_migrations",
       "audio_blobs",
       "auth_sessions",
       "bots",
+      "image_blobs",
       "messages",
       "provider_configs",
       "threads",
@@ -90,14 +92,15 @@ describe("migrasi schema dasar", () => {
 
     const raw = new Database(file);
     try {
-      // Six committed migrations: foundation (0000) + provider (0001) +
+      // Seven committed migrations: foundation (0000) + provider (0001) +
       // provider_configs.masked_hint column (0002) + threads/messages (0003)
       // + audio_blobs and messages.audio_id (0004, voice upload/playback)
-      // + bots, threads.bot_id, and the "Yui" backfill (0005, multi-bot).
+      // + bots, threads.bot_id, and the "Yui" backfill (0005, multi-bot)
+      // + image_blobs and messages.image_ids (0006, bot tool calling).
       const applied = raw
         .prepare("SELECT count(*) AS n FROM __drizzle_migrations")
         .get() as { n: number };
-      expect(applied.n).toBe(6);
+      expect(applied.n).toBe(7);
     } finally {
       raw.close();
     }

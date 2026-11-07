@@ -16,9 +16,10 @@ import {
   resolveActiveKind,
   streamTurn,
   uploadAudioNote,
+  uploadImage,
 } from "./api.ts";
-import { applyTurnEventToConversations, historyToClientMessages } from "./TemplateApp.tsx";
-import type { Conversation, TurnState } from "./TemplateApp.tsx";
+import { applyTurnEventToConversations, historyToClientMessages, nextToolActivity, toolActivityLabel } from "./TemplateApp.tsx";
+import type { Conversation, ToolActivity, TurnState } from "./TemplateApp.tsx";
 import type { MessageDto } from "../shared/app.ts";
 import type { ProviderKind, YuiEvent } from "../shared/engine.ts";
 
@@ -356,6 +357,35 @@ describe("historyToClientMessages", () => {
   it("returns an empty array for empty history", () => {
     expect(historyToClientMessages([])).toEqual([]);
   });
+
+  it("maps image DTOs to owner-scoped preview URLs, and omits images for a plain message", () => {
+    const withImages: MessageDto = {
+      id: "01JCMESSAGEMESSAGEMESSAGEME06",
+      role: "user",
+      text: "[Image]",
+      images: [
+        { id: "01JCIMGAIMGAIMGAIMGAIMGA01", mime: "image/png" },
+        { id: "ab/cd%ef", mime: "image/webp" },
+      ],
+      createdAt: "2026-11-07T09:00:20.000Z",
+    };
+
+    const [message] = historyToClientMessages([withImages]);
+
+    expect(message.images).toEqual([
+      { url: "/api/images/01JCIMGAIMGAIMGAIMGAIMGA01" },
+      { url: "/api/images/ab%2Fcd%25ef" },
+    ]);
+
+    const plain: MessageDto = {
+      id: "01JCMESSAGEMESSAGEMESSAGEME07",
+      role: "assistant",
+      text: "No attachments here.",
+      createdAt: "2026-11-07T09:00:25.000Z",
+    };
+    const [assistant] = historyToClientMessages([plain]);
+    expect(assistant).not.toHaveProperty("images");
+  });
 });
 
 describe("applyTurnEventToConversations", () => {
@@ -393,6 +423,111 @@ describe("applyTurnEventToConversations", () => {
     // The turn learns the thread id for the rest of the stream.
     expect(result.turn.chatId).toBe(placeholder.id);
     expect(result.turn.threadId).toBe(event.threadId);
+  });
+
+  it("tool.activity and turn.settled are default no-ops: the conversations reference is returned UNCHANGED", () => {
+    const conversations: Conversation[] = [
+      { id: THREAD_A, botId: BOT_DTO.id, botName: "Chef", server: true, loaded: true, messages: [] },
+    ];
+    const turn: TurnState = { chatId: THREAD_A, threadId: THREAD_A };
+
+    // Transient tool activity never becomes a message row.
+    const activity: YuiEvent = {
+      type: "tool.activity",
+      threadId: THREAD_A,
+      tool: "web_fetch",
+      phase: "start",
+      detail: "http://example.com/page",
+    };
+    const afterActivity = applyTurnEventToConversations(conversations, turn, activity);
+    expect(afterActivity.conversations).toBe(conversations);
+    expect(afterActivity.turn).toBe(turn);
+
+    // Same for the closing settle event — the wrapper owns composer release.
+    const settled: YuiEvent = { type: "turn.settled", threadId: THREAD_A };
+    const afterSettled = applyTurnEventToConversations(conversations, turn, settled);
+    expect(afterSettled.conversations).toBe(conversations);
+    expect(afterSettled.turn).toBe(turn);
+  });
+});
+
+describe("nextToolActivity — the tool-chip state machine", () => {
+  const turn: TurnState = { chatId: THREAD_A, threadId: THREAD_A };
+
+  it("sets the chip on tool.activity of THIS turn's conversation, copying the typed payload", () => {
+    expect(
+      nextToolActivity(null, turn, {
+        type: "tool.activity",
+        threadId: THREAD_A,
+        tool: "web_fetch",
+        phase: "start",
+        detail: "http://example.com/page",
+      }),
+    ).toEqual({ chatId: THREAD_A, tool: "web_fetch", phase: "start", detail: "http://example.com/page" });
+
+    expect(
+      nextToolActivity(null, turn, {
+        type: "tool.activity",
+        threadId: THREAD_A,
+        tool: "view_image",
+        phase: "end",
+        isError: true,
+      }),
+    ).toEqual({ chatId: THREAD_A, tool: "view_image", phase: "end", isError: true });
+  });
+
+  it("ignores a FOREIGN thread's tool.activity (the chip state reference is unchanged)", () => {
+    const current: ToolActivity = { chatId: THREAD_A, tool: "web_fetch", phase: "start" };
+    expect(
+      nextToolActivity(current, turn, {
+        type: "tool.activity",
+        threadId: "thread-foreign",
+        tool: "web_fetch",
+        phase: "end",
+      }),
+    ).toBe(current);
+  });
+
+  it("clears the chip on turn.settled scoped to this turn's conversation; a foreign chip survives", () => {
+    const mine: ToolActivity = { chatId: THREAD_A, tool: "web_fetch", phase: "start" };
+    expect(nextToolActivity(mine, turn, { type: "turn.settled", threadId: THREAD_A })).toBeNull();
+    expect(nextToolActivity(null, turn, { type: "turn.settled", threadId: THREAD_A })).toBeNull();
+
+    const foreign: ToolActivity = { chatId: "thread-other", tool: "web_fetch", phase: "start" };
+    expect(nextToolActivity(foreign, turn, { type: "turn.settled", threadId: THREAD_A })).toBe(foreign);
+  });
+
+  it("every other event leaves the state reference unchanged", () => {
+    const current: ToolActivity = { chatId: THREAD_A, tool: "view_image", phase: "start" };
+    expect(nextToolActivity(current, turn, { type: "message.delta", threadId: THREAD_A, messageId: "m", role: "assistant", text: "x" })).toBe(current);
+    expect(nextToolActivity(current, turn, { type: "thread.updated", threadId: THREAD_A, updated_at: "t" })).toBe(current);
+  });
+
+  it("a placeholder conversation turn (no thread yet) addresses its chat id", () => {
+    const placeholder: TurnState = { chatId: "bot:bot-1" };
+    const set = nextToolActivity(null, placeholder, {
+      type: "tool.activity",
+      threadId: "bot:bot-1",
+      tool: "web_fetch",
+      phase: "start",
+    });
+    expect(set).toEqual({ chatId: "bot:bot-1", tool: "web_fetch", phase: "start" });
+    expect(nextToolActivity(set, placeholder, { type: "turn.settled", threadId: "bot:bot-1" })).toBeNull();
+  });
+});
+
+describe("toolActivityLabel", () => {
+  it("maps the allowlisted tools and marks error ends; unknown names stay raw", () => {
+    expect(toolActivityLabel({ chatId: "t", tool: "web_fetch", phase: "start" })).toBe("Reading a web page");
+    expect(toolActivityLabel({ chatId: "t", tool: "view_image", phase: "start" })).toBe("Looking at an image");
+    expect(toolActivityLabel({ chatId: "t", tool: "view_image", phase: "end" })).toBe("Looking at an image");
+    expect(toolActivityLabel({ chatId: "t", tool: "view_image", phase: "end", isError: true })).toBe(
+      "Looking at an image — unavailable",
+    );
+    expect(toolActivityLabel({ chatId: "t", tool: "web_fetch", phase: "end", isError: true })).toBe(
+      "Reading a web page — unavailable",
+    );
+    expect(toolActivityLabel({ chatId: "t", tool: "mystery", phase: "start" })).toBe("Using mystery");
   });
 });
 
@@ -738,6 +873,62 @@ describe("uploadAudioNote", () => {
   });
 });
 
+const IMAGE_ID = "01JCIMAGEIMAGEIMAGEIMAGEIM01";
+
+describe("uploadImage", () => {
+  it("posts multipart FormData (image file) to /api/images and returns {id, mime}", async () => {
+    const mock = stubFetch(jsonResponse({ id: IMAGE_ID, mime: "image/png" }, 201));
+    const blob = new Blob([new Uint8Array([9, 9, 9])], { type: "image/png" });
+
+    const uploaded = await uploadImage(blob);
+
+    expect(uploaded).toEqual({ id: IMAGE_ID, mime: "image/png" });
+    const [url, init] = firstCall(mock);
+    expect(url).toBe("/api/images");
+    expect(init.method).toBe("POST");
+    // Multipart, not JSON: the browser sets the content-type with the boundary.
+    expect(init.body).toBeInstanceOf(FormData);
+    expect(init.headers).toBeUndefined();
+    const file = init.body as FormData;
+    const stored = file.get("file");
+    expect(stored).toBeInstanceOf(File);
+    // The blob's content type rides along — the server stores it verbatim and
+    // echoes it back in the DTO.
+    expect((stored as File).type).toBe("image/png");
+    expect((stored as File).size).toBe(3);
+  });
+
+  it("413 envelope → ApiError payload_too_large", async () => {
+    stubFetch(
+      jsonResponse(
+        { error: { code: "payload_too_large", message: "Image upload exceeds the 5 MB limit." } },
+        413,
+      ),
+    );
+
+    await expect(uploadImage(new Blob([new Uint8Array([1])], { type: "image/png" }))).rejects.toMatchObject({
+      name: "ApiError",
+      code: "payload_too_large",
+      message: "Image upload exceeds the 5 MB limit.",
+    });
+  });
+
+  it("400 envelope (non-image mime) → ApiError invalid_request", async () => {
+    stubFetch(
+      jsonResponse(
+        { error: { code: "invalid_request", message: "Field 'file' must be an image file." } },
+        400,
+      ),
+    );
+
+    await expect(uploadImage(new Blob([new Uint8Array([1])], { type: "video/mp4" }))).rejects.toMatchObject({
+      name: "ApiError",
+      code: "invalid_request",
+      message: "Field 'file' must be an image file.",
+    });
+  });
+});
+
 describe("streamTurn", () => {
   it("posts {content,clientToken} with no threadId key for a new thread and dispatches events in stream order", async () => {
     const mock = stubFetch(
@@ -891,6 +1082,82 @@ describe("streamTurn", () => {
       clientToken: "01JCTOKENTOKENTOKENTOKENTOK01",
     });
     expect("content" in body).toBe(false);
+  });
+
+  it("sends imageIds beside an (empty) content string for an image turn", async () => {
+    const mock = stubFetch(sseResponse([sseFrame("turn.settled", { threadId: THREAD_A })]));
+
+    await streamTurn(
+      // Mirrors the production call in sendServerMessage with attachments: the
+      // text may be empty because the server stores the image placeholder.
+      { content: "", imageIds: [IMAGE_ID], threadId: THREAD_A },
+      () => undefined,
+    );
+
+    const [, init] = firstCall(mock);
+    expect(JSON.parse(String(init.body))).toStrictEqual({
+      content: "",
+      imageIds: [IMAGE_ID],
+      threadId: THREAD_A,
+    });
+  });
+
+  it("dispatches tool.activity frames in stream order with their typed payload", async () => {
+    stubFetch(
+      sseResponse([
+        sseFrame("thread.updated", { threadId: THREAD_A, updated_at: "2026-11-07T10:00:00.000Z" }),
+        sseFrame("tool.activity", {
+          threadId: THREAD_A,
+          tool: "web_fetch",
+          phase: "start",
+          detail: "http://example.com/page",
+        }),
+        sseFrame("tool.activity", {
+          threadId: THREAD_A,
+          tool: "web_fetch",
+          phase: "end",
+          detail: "blocked: private address (10.0.0.1)",
+          isError: true,
+        }),
+        sseFrame("message.final", {
+          threadId: THREAD_A,
+          messageId: "01JCMESSAGEMESSAGEMESSAGEME02",
+          role: "assistant",
+          text: "Refused.",
+        }),
+        sseFrame("turn.settled", { threadId: THREAD_A }),
+      ]),
+    );
+    const events: YuiEvent[] = [];
+
+    await streamTurn({ content: "Fetch", threadId: THREAD_A }, event => {
+      events.push(event);
+    });
+
+    expect(events.map(event => event.type)).toEqual([
+      "thread.updated",
+      "tool.activity",
+      "tool.activity",
+      "message.final",
+      "turn.settled",
+    ]);
+    // The frame's dispatch name restores `type`; the payload keeps the rest of
+    // the contract shape (AD-4 extension).
+    expect(events[1]).toEqual({
+      type: "tool.activity",
+      threadId: THREAD_A,
+      tool: "web_fetch",
+      phase: "start",
+      detail: "http://example.com/page",
+    });
+    expect(events[2]).toEqual({
+      type: "tool.activity",
+      threadId: THREAD_A,
+      tool: "web_fetch",
+      phase: "end",
+      detail: "blocked: private address (10.0.0.1)",
+      isError: true,
+    });
   });
 
   it("rejects with the envelope ApiError on a pre-stream 4xx response", async () => {

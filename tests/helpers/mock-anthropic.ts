@@ -39,6 +39,12 @@ export type MockAnthropicOptions = {
   behavior?: MockBehavior;
   /** Jeda antar-event ms (default 15) — meniru laju streaming nyata. */
   chunkDelayMs?: number;
+  /** bot-tool-calling: the FIRST API call emits one tool_use content_block
+   * (input via input_json_delta, stop_reason "tool_use") instead of plain
+   * text — the engine executes the tool and calls again, and the follow-up
+   * call streams the normal replyText. `textBefore`, when set, emits a text
+   * block FIRST — the narrating preamble of a tool turn. */
+  toolCall?: { name: string; arguments: Record<string, unknown>; textBefore?: string };
 };
 
 const CONTENT_CHUNK_CHARS = 12;
@@ -62,6 +68,10 @@ export function startMockAnthropic(options: MockAnthropicOptions = {}): Promise<
 
   const requests: MockRequest[] = [];
   const probes: MockRequest[] = [];
+  // API-call ordinal for the `toolCall` option: the scripted tool_use rides
+  // the FIRST provider call only; the engine's follow-up call gets the normal
+  // text stream.
+  let apiCalls = 0;
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -81,7 +91,10 @@ export function startMockAnthropic(options: MockAnthropicOptions = {}): Promise<
       // suffix cannot misfile a real call, and sub-paths (e.g. count_tokens)
       // stay out.
       const path = (req.url ?? "").split("?")[0]!;
+      let isApiCall = false;
       if (req.method === "POST" && path === "/v1/messages") {
+        isApiCall = true;
+        apiCalls += 1;
         requests.push(record);
       } else {
         probes.push(record);
@@ -112,6 +125,57 @@ export function startMockAnthropic(options: MockAnthropicOptions = {}): Promise<
           },
         }),
       );
+      if (isApiCall && apiCalls === 1 && options.toolCall !== undefined) {
+        // Scripted tool_use: the wire shape the engine's anthropic-messages
+        // parser turns into a toolCall block — optional text preamble block
+        // first (index 0), then the tool_use block, input via ONE
+        // input_json_delta, block stop, stop_reason tool_use.
+        const tool = options.toolCall;
+        let blockIndex = 0;
+        if (tool.textBefore !== undefined && tool.textBefore.length > 0) {
+          res.write(
+            sseFrame("content_block_start", {
+              type: "content_block_start",
+              index: blockIndex,
+              content_block: { type: "text", text: "" },
+            }),
+          );
+          res.write(
+            sseFrame("content_block_delta", {
+              type: "content_block_delta",
+              index: blockIndex,
+              delta: { type: "text_delta", text: tool.textBefore },
+            }),
+          );
+          res.write(sseFrame("content_block_stop", { type: "content_block_stop", index: blockIndex }));
+          blockIndex += 1;
+        }
+        res.write(
+          sseFrame("content_block_start", {
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "tool_use", id: "toolu_yui_mock_1", name: tool.name, input: {} },
+          }),
+        );
+        res.write(
+          sseFrame("content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify(tool.arguments) },
+          }),
+        );
+        res.write(sseFrame("content_block_stop", { type: "content_block_stop", index: blockIndex }));
+        res.write(
+          sseFrame("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "tool_use" },
+            usage: { output_tokens: JSON.stringify(tool.arguments).length },
+          }),
+        );
+        res.write(sseFrame("message_stop", { type: "message_stop" }));
+        res.end();
+        return;
+      }
       res.write(
         sseFrame("content_block_start", {
           type: "content_block_start",

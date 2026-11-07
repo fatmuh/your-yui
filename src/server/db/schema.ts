@@ -117,6 +117,11 @@ export const messages = sqliteTable(
     // is a dangling-pointer-by-design backstop, not a delete trigger. The turn
     // route validates ownership at attach time via resolveAudioBlob.
     audioId: text("audio_id").references(() => audioBlobs.id),
+    // bot-tool-calling epic (AD-6): image attachments as a JSON array of
+    // `image_blobs.id` (a JSON array cannot carry an FK — ownership was
+    // validated owner-scoped at attach time, and projection re-resolves each
+    // id owner-scoped, mirroring the audio pattern). NULL = no images.
+    imageIds: text("image_ids"),
     createdAt: integer("created_at").notNull(),
   },
   (table) => [
@@ -143,6 +148,21 @@ export const audioBlobs = sqliteTable("audio_blobs", {
   createdAt: integer("created_at").notNull(),
 });
 
+// bot-tool-calling epic (AD-6): `image_blobs` — one row per uploaded image,
+// mirroring the audio protocol exactly (upload → owner-scoped blob → the turn
+// references ids → playback/preview GET is owner-scoped). Bytes live ONLY in
+// SQLite; `mime` is stored verbatim from the upload; no index beyond the PK
+// (access is by-id; the table is bounded by the 5 MB per-blob upload cap).
+export const imageBlobs = sqliteTable("image_blobs", {
+  id: text("id").primaryKey(),
+  ownerUserId: text("owner_user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  mime: text("mime").notNull(),
+  blob: blob("blob", { mode: "buffer" }).notNull(),
+  createdAt: integer("created_at").notNull(),
+});
+
 export type User = InferSelectModel<typeof users>;
 export type AuthSession = InferSelectModel<typeof authSessions>;
 export type ProviderConfig = InferSelectModel<typeof providerConfigs>;
@@ -150,3 +170,4 @@ export type Bot = InferSelectModel<typeof bots>;
 export type Thread = InferSelectModel<typeof threads>;
 export type Message = InferSelectModel<typeof messages>;
 export type AudioBlob = InferSelectModel<typeof audioBlobs>;
+export type ImageBlob = InferSelectModel<typeof imageBlobs>;

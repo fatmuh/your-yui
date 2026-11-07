@@ -7,6 +7,7 @@ import type { Hono } from "hono";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
 import { threads } from "../db/schema.ts";
+import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { insertBot } from "../bots/store.ts";
 import { upsertProviderConfig } from "../providers/store.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../../tests/helpers/mock-openai.ts";
@@ -388,4 +389,99 @@ describe("POST /api/engine/turn kind=anthropic — matriks story", () => {
       modelId: "m1",
     });
   });
+
+  // bot-tool-calling: a scripted tool_use over the anthropic wire flows through
+  // the same allowlisted custom tools and the same SSRF guard.
+  it("tool_use turn (view_image on a loopback literal): tool.activity start+end(isError) precede settled; contract intact; provider called twice", async () => {
+    const { app, db } = makeApp();
+    const preamble = "One moment while I look.";
+    const reply = "Anthropic cannot view that image either.";
+    const mock = await startMockAnthropic({
+      replyText: reply,
+      toolCall: { name: "view_image", arguments: { url: "http://127.0.0.1:80/photo.jpg" }, textBefore: preamble },
+    });
+    openMocks.push(mock);
+    const user = await registerUser(app, "anthropic-tool");
+    const apiKey = "sk-ant-api-tool-3131tool";
+    seedAnthropicConfig(db, user.userId, mock, apiKey);
+    seedThread(db, user.userId, "thread-anthropic-tool");
+
+    const res = await postTurn(app, user.token, {
+      kind: "anthropic",
+      threadId: "thread-anthropic-tool",
+      content: "Look at this picture",
+      clientToken: "tok-anthropic-tool",
+    });
+    expect(res.status).toBe(200);
+    const { events, raw } = await readSse(res);
+    const sequence = names(events);
+
+    // Same transient tool.activity contract as the openai wire: start with the
+    // URL, end with the guard reason, both strictly before the last event.
+    const activities = events.filter((frame) => frame.event === "tool.activity");
+    expect(activities).toHaveLength(2);
+    expect(activities[0].data).toEqual({
+      threadId: "thread-anthropic-tool",
+      tool: "view_image",
+      phase: "start",
+      detail: "http://127.0.0.1:80/photo.jpg",
+    });
+    expect(activities[1].data).toMatchObject({ phase: "end", isError: true });
+    expect(String(activities[1].data.detail)).toMatch(/loopback address/);
+    expect(sequence[sequence.length - 1]).toBe("turn.settled");
+    expect(sequence.lastIndexOf("tool.activity")).toBeLessThan(sequence.length - 1);
+    expect(sequence).not.toContain("error");
+
+    // The final message joins the preamble hop and the reply hop with a
+    // paragraph break — same two-hop assembly as the openai wire.
+    const finals = events.filter((frame) => frame.event === "message.final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0].data.text).toBe(`${preamble}\n\n${reply}`);
+    expect(finals[0].data.clientToken).toBe("tok-anthropic-tool");
+
+    // Tool call + follow-up on the anthropic wire, refusal carried back.
+    expect(mock.requests).toHaveLength(2);
+    expect(mock.requests[1].body).toContain("loopback address");
+    expect(raw).not.toContain(apiKey);
+  }, 30_000);
+
+  // bot-tool-calling: uploaded images reach the provider in anthropic wire form.
+  it("image turn: the anthropic body carries the base64 image source block", async () => {
+    const { app, db } = makeApp();
+    const mock = await startMockAnthropic({ replyText: "Anthropic sees the picture." });
+    openMocks.push(mock);
+    const user = await registerUser(app, "anthropic-gambar");
+    seedAnthropicConfig(db, user.userId, mock, "sk-ant-api-gambar-4242img");
+    const botId = seedBot(db, user.userId);
+
+    // A real 1x1 PNG: the engine decodes inline images and drops undecodable
+    // bytes with an omission note — the fixture must survive that pipeline.
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      "base64",
+    );
+    const bytes = new Uint8Array(png);
+    const form = new FormData();
+    form.append("file", new File([bytes], "dot.png", { type: "image/png" }));
+    const upload = await app.request("/api/images", {
+      method: "POST",
+      body: form,
+      headers: { cookie: `${SESSION_COOKIE}=${user.token}` },
+    });
+    expect(upload.status).toBe(201);
+    const imageId = ((await upload.json()) as { id: string }).id;
+
+    const res = await postTurn(app, user.token, { kind: "anthropic", content: "", imageIds: [imageId], botId });
+    expect(res.status).toBe(200);
+    const { events } = await readSse(res);
+    expect(names(events)).toEqual(expect.arrayContaining(["message.final", "turn.settled"]));
+
+    // anthropic-messages wire: base64 source block with the stored media type.
+    expect(mock.requests).toHaveLength(1);
+    expect(mock.requests[0].body).toContain(`"type":"base64"`);
+    expect(mock.requests[0].body).toContain(`"media_type":"image/png"`);
+    expect(mock.requests[0].body).toContain(Buffer.from(bytes).toString("base64"));
+    // The placeholder line rode the transcript.
+    expect(mock.requests[0].body).toContain("[Image]");
+  }, 30_000);
 });

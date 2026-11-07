@@ -112,6 +112,14 @@ export type MessageDto = {
    * placeholder.
    */
   audio?: { id: string; mime: string; durationMs: number };
+  /**
+   * Images attached to this user message (bot-tool-calling epic): thumbnails
+   * re-load from `/api/images/:id` (owner-scoped). Present only on user
+   * messages sent with image attachments. Omitted entirely when the message
+   * has none, or an id no longer resolves to a blob — `text` then still
+   * carries the stored placeholder.
+   */
+  images?: { id: string; mime: string }[];
   /** ISO-8601 UTC (DB stores epoch-ms; converted at the edge). */
   createdAt: string;
 };

@@ -15,8 +15,14 @@ import {
   resolveThread,
 } from "../conversations/turn-store.ts";
 import { resolveAudioBlob, voiceNotePlaceholder } from "../audio/store.ts";
+import { imageNotePlaceholder, resolveImageBlob } from "../images/store.ts";
 import { createEngineAdapter, EngineAdapterError } from "./adapter.ts";
-import { PROVIDER_KINDS, type ProviderKind, type YuiEvent } from "../../shared/engine.ts";
+import {
+  PROVIDER_KINDS,
+  type EngineImageInput,
+  type ProviderKind,
+  type YuiEvent,
+} from "../../shared/engine.ts";
 
 // Route SSE giliran (R4+R3, AD-4, AD-5, AD-9): satu POST = satu giliran penuh,
 // dan route adalah PENULIS tunggal threads/messages — pesan user tersimpan
@@ -31,6 +37,8 @@ import { PROVIDER_KINDS, type ProviderKind, type YuiEvent } from "../../shared/e
 // sungguh terjadi), tanpa pesan asisten setengah jadi.
 
 const MAX_CONTENT_CHARS = 8_000;
+/** Max image attachments per turn (plan Always: at most 3 per turn). */
+const MAX_IMAGES_PER_TURN = 3;
 
 // Revocation poll cadence for an in-flight turn stream (AD-9): a logout is
 // detected within this window; the lookup is an indexed token-hash select,
@@ -86,6 +94,42 @@ export function engineRoutes(db: YuiDatabase): Hono {
     }
     const audioId = typeof rawAudioId === "string" && rawAudioId.trim().length > 0 ? rawAudioId : undefined;
 
+    // bot-tool-calling: `imageIds` rides the CONTENT path only (the audio XOR
+    // stands): 1..3 ids of blobs this session uploaded, attached to the same
+    // turn as optional text. Shape checks stay pre-stream 400s; the blobs are
+    // resolved owner-scoped below, BEFORE any thread/message write.
+    const rawImageIds = body?.imageIds;
+    if (rawImageIds !== undefined) {
+      if (
+        !Array.isArray(rawImageIds) ||
+        rawImageIds.length === 0 ||
+        rawImageIds.length > MAX_IMAGES_PER_TURN ||
+        rawImageIds.some((id) => typeof id !== "string" || id.trim().length === 0)
+      ) {
+        return c.json(
+          {
+            error: {
+              code: "invalid_request",
+              message: `Request body "imageIds" must be an array of 1 to ${MAX_IMAGES_PER_TURN} uploaded image blob ids.`,
+            },
+          },
+          400,
+        );
+      }
+      if (audioId !== undefined) {
+        return c.json(
+          {
+            error: {
+              code: "invalid_request",
+              message: `Request body "imageIds" can only be sent with a text turn, not together with "audioId".`,
+            },
+          },
+          400,
+        );
+      }
+    }
+    const imageIds = Array.isArray(rawImageIds) ? (rawImageIds as string[]) : undefined;
+
     // Presence of `content` under the XOR rule: a non-empty string counts, and
     // any other defined value still counts — a malformed value must not slip
     // past the either/or rejection below.
@@ -106,26 +150,54 @@ export function engineRoutes(db: YuiDatabase): Hono {
     // The text stored as this turn's user message: the validated content for
     // text turns, or the duration-derived placeholder for voice turns (single
     // source of truth: voiceNotePlaceholder in the audio store). A voice turn
-    // also carries the blob id onto the inserted message row.
+    // also carries the blob id onto the inserted message row. An image turn
+    // may send EMPTY text ("" with imageIds) — the stored text is then the
+    // image placeholder (imageNotePlaceholder).
     let userText: string;
     let userAudioId: string | undefined;
+    let promptImages: EngineImageInput[] | undefined;
+    let storedImageIds: string[] | undefined;
     if (audioId === undefined) {
+      const hasImages = imageIds !== undefined && imageIds.length > 0;
+      // Absent `content` with valid imageIds is an image-only turn — the
+      // frozen matrix is {content?|"", imageIds≤3}, so absent is treated as ""
+      // (any other non-string value, e.g. null or a number, still 400s).
+      const normalizedContent = content === undefined && hasImages ? "" : content;
       if (
-        typeof content !== "string" ||
-        content.trim().length === 0 ||
-        content.length > MAX_CONTENT_CHARS
+        typeof normalizedContent !== "string" ||
+        normalizedContent.length > MAX_CONTENT_CHARS ||
+        (normalizedContent.trim().length === 0 && !hasImages)
       ) {
         return c.json(
           {
             error: {
               code: "invalid_request",
-              message: `Request body must be JSON with a non-empty "content" string of at most ${MAX_CONTENT_CHARS} characters.`,
+              message: hasImages
+                ? `Request body must be JSON with a "content" string of at most ${MAX_CONTENT_CHARS} characters (may be empty with "imageIds").`
+                : `Request body must be JSON with a non-empty "content" string of at most ${MAX_CONTENT_CHARS} characters.`,
             },
           },
           400,
         );
       }
-      userText = content;
+      userText = normalizedContent.trim().length > 0 ? normalizedContent : imageNotePlaceholder(imageIds!.length);
+      if (hasImages) {
+        // Owner-scoped attach, one seam per id: foreign and unknown ids share
+        // one identical 404 (no existence leak), checked BEFORE any
+        // thread/message write so a rejected attach leaves nothing behind.
+        const blobs = imageIds!.map((id) => resolveImageBlob(db, user.id, id));
+        if (blobs.some((blob) => blob === null)) {
+          return c.json(
+            { error: { code: "not_found", message: "Image not found." } },
+            404,
+          );
+        }
+        storedImageIds = blobs.map((blob) => blob!.id);
+        promptImages = blobs.map((blob) => ({
+          data: blob!.blob.toString("base64"),
+          mimeType: blob!.mime,
+        }));
+      }
     } else {
       // Owner-scoped attach via the frozen story-1 seam. Foreign and unknown
       // ids share one identical 404 (no existence leak), and the check runs
@@ -242,6 +314,7 @@ export function engineRoutes(db: YuiDatabase): Hono {
         userText,
         turnStartedAt,
         userAudioId,
+        storedImageIds,
       );
       if (created === null) {
         return c.json(
@@ -279,7 +352,7 @@ export function engineRoutes(db: YuiDatabase): Hono {
       // the default persona keeps such rows chat-able instead of failing hard.
       const bot = thread.botId === null ? null : getBotById(db, user.id, thread.botId);
       persona = bot === null ? DEFAULT_BOT_PERSONA : resolveBotPersona(bot);
-      userWriteAt = appendUserMessage(db, user.id, threadId, userText, turnStartedAt, userAudioId).updatedAt;
+      userWriteAt = appendUserMessage(db, user.id, threadId, userText, turnStartedAt, userAudioId, storedImageIds).updatedAt;
     }
 
     // (3) transkrip thread (termasuk pesan user barusan) = konten prompt
@@ -376,7 +449,10 @@ export function engineRoutes(db: YuiDatabase): Hono {
       };
 
       try {
-        await adapter.prompt({ sessionId, content: transcript, persona, clientToken }, onEvent);
+        await adapter.prompt(
+          { sessionId, content: transcript, persona, clientToken, images: promptImages },
+          onEvent,
+        );
       } catch (error) {
         // Defensive: error di luar jaminan adapter tetap berakhir settled
         // (AD-4). Pesan user tetap tersimpan; pesan asisten tidak dibuat.

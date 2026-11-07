@@ -7,6 +7,7 @@ import { authRoutes } from "./auth/routes.ts";
 import { botRoutes } from "./bots/routes.ts";
 import { conversationRoutes } from "./conversations/routes.ts";
 import { engineRoutes } from "./engine/routes.ts";
+import { imageRoutes } from "./images/routes.ts";
 import { providerConfigRoutes } from "./providers/routes.ts";
 
 export function createApp(staticRoot = "dist", db?: YuiDatabase) {
@@ -40,6 +41,7 @@ export function createApp(staticRoot = "dist", db?: YuiDatabase) {
     app.route("/api", providerConfigRoutes(db));
     app.route("/api", conversationRoutes(db));
     app.route("/api", audioRoutes(db));
+    app.route("/api", imageRoutes(db));
     app.route("/api", botRoutes(db));
   }
 

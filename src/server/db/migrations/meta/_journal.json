@@ -43,6 +43,13 @@
       "when": 1794043895136,
       "tag": "0005_wakeful_maverick",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794050217261,
+      "tag": "0006_bright_annihilus",
+      "breakpoints": true
     }
   ]
 }

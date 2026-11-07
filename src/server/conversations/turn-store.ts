@@ -126,6 +126,7 @@ export function createThreadWithMessage(
   content: string,
   at: number,
   audioId?: string,
+  imageIds?: string[],
 ): CreatedThread | null {
   if (getBotById(db, userId, botId) === null) {
     return null;
@@ -148,6 +149,9 @@ export function createThreadWithMessage(
       createdAt: writeAt,
       // epic-voice: voice turns store the placeholder text AND the blob ref.
       ...(audioId === undefined ? {} : { audioId }),
+      // bot-tool-calling: image turns store the placeholder/content text AND
+      // the blob id refs as a JSON array (audio XOR images by route validation).
+      ...(imageIds === undefined || imageIds.length === 0 ? {} : { imageIds: JSON.stringify(imageIds) }),
     })
     .run();
   return { threadId, title, updatedAt: writeAt };
@@ -171,6 +175,7 @@ export function appendUserMessage(
   text: string,
   at: number,
   audioId?: string,
+  imageIds?: string[],
 ): AppendedMessage {
   const messageId = newUlid();
   const writeAt = monotonicThreadTime(db, userId, threadId, at);
@@ -183,6 +188,8 @@ export function appendUserMessage(
       createdAt: writeAt,
       // epic-voice: voice turns store the placeholder text AND the blob ref.
       ...(audioId === undefined ? {} : { audioId }),
+      // bot-tool-calling: image turns store the blob id refs as a JSON array.
+      ...(imageIds === undefined || imageIds.length === 0 ? {} : { imageIds: JSON.stringify(imageIds) }),
     })
     .run();
   const updatedAt = touchThread(db, userId, threadId, writeAt);

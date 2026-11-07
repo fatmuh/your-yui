@@ -560,3 +560,312 @@ describe("POST /api/engine/turn — voice notes (epic-voice story 2)", () => {
     expect(db.select().from(messages).all()).toEqual([]);
   });
 });
+
+// bot-tool-calling: proof that a scripted model tool call flows through the
+// two allowlisted custom tools, the SSRF guard refuses private targets, and
+// the transient tool.activity events ride the SAME SSE contract (always
+// before turn.settled, existing event shapes untouched).
+describe("POST /api/engine/turn — bot tool calling", () => {
+  it("tool turn: tool.activity start (URL) then end (isError + guard reason) precede settled; the loop calls the provider twice; the blocked target is never fetched", async () => {
+    const { app, db } = makeApp();
+    const preamble = "Let me check that page.";
+    const reply = "The fetch was refused, so here is what I already know.";
+    const mock = await startMockOpenAI({
+      replyText: reply,
+      toolCall: { name: "web_fetch", arguments: { url: "http://127.0.0.1:80/secret" }, textBefore: preamble },
+    });
+    openMocks.push(mock);
+    const user = await registerUser(app, "tool-activity");
+    seedConfig(db, user.userId, mock, "sk-live-tool-1111tool");
+    seedThread(db, user.userId, "thread-tool-1");
+
+    const res = await postTurn(app, user.token, {
+      threadId: "thread-tool-1",
+      content: "Fetch that page",
+      clientToken: "tok-tool-1",
+    });
+    expect(res.status).toBe(200);
+    const { events, raw } = await readSse(res);
+    const sequence = names(events);
+
+    // Tool activity is transient state, not messages: exactly one start and
+    // one end for the single scripted call, both strictly before settled.
+    const activities = events.filter((frame) => frame.event === "tool.activity");
+    expect(activities).toHaveLength(2);
+    expect(activities[0].data).toEqual({
+      threadId: "thread-tool-1",
+      tool: "web_fetch",
+      phase: "start",
+      detail: "http://127.0.0.1:80/secret",
+    });
+    expect(activities[1].data).toMatchObject({
+      threadId: "thread-tool-1",
+      tool: "web_fetch",
+      phase: "end",
+      isError: true,
+    });
+    expect(String(activities[1].data.detail)).toMatch(/loopback address/);
+    expect(sequence.indexOf("tool.activity")).toBeLessThan(sequence.lastIndexOf("turn.settled"));
+    expect(sequence.lastIndexOf("tool.activity")).toBeLessThan(sequence.length - 1);
+    expect(sequence[sequence.length - 1]).toBe("turn.settled");
+
+    // The rest of the AD-4 contract is intact: the tool loop's intermediate
+    // stopReason-toolUse assistant message emits NO final of its own; deltas
+    // and exactly ONE final still stream, no error. The final joins the two
+    // provider hops with a paragraph break — the streamed preamble and the
+    // follow-up reply — instead of jamming them together.
+    const deltas = events.filter((frame) => frame.event === "message.delta");
+    const finals = events.filter((frame) => frame.event === "message.final");
+    expect(deltas.length).toBeGreaterThanOrEqual(2);
+    expect(finals).toHaveLength(1);
+    expect(finals[0].data.text).toBe(`${preamble}\n\n${reply}`);
+    expect(finals[0].data.clientToken).toBe("tok-tool-1");
+    expect(sequence).not.toContain("error");
+
+    // The persisted assistant row keeps BOTH hops, joined the same way.
+    const assistantRow = db.select().from(messages).all().find((row) => row.role === "assistant");
+    expect(assistantRow?.text).toBe(`${preamble}\n\n${reply}`);
+
+    // The agent loop made exactly two provider calls (tool call → follow-up),
+    // and the follow-up carries the guard's refusal as the tool result.
+    expect(mock.requests).toHaveLength(2);
+    expect(mock.requests[1].body).toContain("loopback address");
+    // The refused detail never smuggles page bodies or credentials out.
+    expect(raw).not.toContain("sk-live-tool");
+  }, 30_000);
+
+  it("allowlisted tool name reaches the tool; the blocked activity stays a readable isError detail", async () => {
+    // view_image over a loopback LITERAL: the guard refuses at the URL layer,
+    // before any DNS or connection — proving the second tool is wired through
+    // the same seam without any network egress.
+    const { app, db } = makeApp();
+    const reply = "I cannot view that image.";
+    const mock = await startMockOpenAI({
+      replyText: reply,
+      toolCall: { name: "view_image", arguments: { url: "http://127.0.0.1:80/photo.jpg" } },
+    });
+    openMocks.push(mock);
+    const user = await registerUser(app, "tool-view-image");
+    seedConfig(db, user.userId, mock, "sk-live-view-2222img");
+    seedThread(db, user.userId, "thread-tool-2");
+
+    const res = await postTurn(app, user.token, { threadId: "thread-tool-2", content: "Look at this" });
+    expect(res.status).toBe(200);
+    const { events } = await readSse(res);
+    const activities = events.filter((frame) => frame.event === "tool.activity");
+    expect(activities.map((frame) => frame.data.tool)).toEqual(["view_image", "view_image"]);
+    expect(activities[1].data.isError).toBe(true);
+    const finalEvent = events.find((frame) => frame.event === "message.final");
+    expect(finalEvent?.data.text).toBe(reply);
+    expect(mock.requests).toHaveLength(2);
+  }, 30_000);
+
+  it("tool.activity start detail is capped at 200 chars and is a PREFIX of the requested URL", async () => {
+    const { app, db } = makeApp();
+    const longUrl = `http://127.0.0.1:80/${"a".repeat(220)}`;
+    const mock = await startMockOpenAI({
+      replyText: "Done.",
+      toolCall: { name: "web_fetch", arguments: { url: longUrl } },
+    });
+    openMocks.push(mock);
+    const user = await registerUser(app, "tool-detail-cap");
+    seedConfig(db, user.userId, mock, "sk-live-cap-3333cap");
+    seedThread(db, user.userId, "thread-tool-cap");
+
+    const res = await postTurn(app, user.token, { threadId: "thread-tool-cap", content: "Fetch it" });
+    expect(res.status).toBe(200);
+    const { events } = await readSse(res);
+    const activities = events.filter((frame) => frame.event === "tool.activity");
+    expect(activities).toHaveLength(2);
+    const detail = String(activities[0].data.detail);
+    expect(detail).toHaveLength(200);
+    expect(longUrl.startsWith(detail)).toBe(true);
+    expect(detail).toBe(longUrl.slice(0, 200));
+  }, 30_000);
+});
+
+// bot-tool-calling: the image-attachment protocol mirrors epic-voice —
+// imageIds ride the content path, the attach is owner-scoped pre-write, the
+// prompt carries the decoded images to the provider, and history renders them.
+describe("POST /api/engine/turn — image attachments", () => {
+  /** Upload one image through the real /api/images route; returns {id, mime}. */
+  async function uploadImage(
+    app: Hono,
+    token: string,
+    bytes: Uint8Array,
+    mime = "image/png",
+  ): Promise<{ id: string; mime: string }> {
+    const form = new FormData();
+    form.append("file", new File([bytes], "image.png", { type: mime }));
+    const res = await app.request("/api/images", {
+      method: "POST",
+      body: form,
+      headers: { cookie: `${SESSION_COOKIE}=${token}` },
+    });
+    expect(res.status).toBe(201);
+    return (await res.json()) as { id: string; mime: string };
+  }
+
+  /**
+   * A REAL 1x1 RGBA PNG (70 bytes): the engine decodes inline images (resize
+   * check) and drops undecodable bytes with an omission note — the fixture
+   * must survive that pipeline so the wire assertion sees actual image data.
+   */
+  const PNG_1X1 = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "base64",
+  );
+
+  function imageBytes(): Uint8Array {
+    return new Uint8Array(PNG_1X1);
+  }
+
+  it("image-only turn (content \"\" + imageIds): placeholder stored with image_ids, images reach the provider wire, history exposes images", async () => {
+    const { app, db } = makeApp();
+    const reply = "I can see the attached picture.";
+    const mock = await startMockOpenAI({ replyText: reply });
+    openMocks.push(mock);
+    const user = await registerUser(app, "gambar-baru");
+    seedConfig(db, user.userId, mock, "sk-live-gambar-3333pic");
+    const botId = seedBot(db, user.userId);
+    const bytes = imageBytes();
+    const uploaded = await uploadImage(app, user.token, bytes);
+
+    const res = await postTurn(app, user.token, { content: "", imageIds: [uploaded.id], botId });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+    const { events } = await readSse(res);
+    const sequence = names(events);
+
+    // Full contract on the content path, now with EMPTY text: thread.updated
+    // first with the placeholder-derived title, deltas, one final, settled.
+    expect(sequence[0]).toBe("thread.updated");
+    expect(events[0].data.title).toBe("[Image]");
+    const threadId = events[0].data.threadId;
+    expect(sequence[sequence.length - 1]).toBe("turn.settled");
+    expect(sequence).not.toContain("error");
+    const finalEvent = events.find((frame) => frame.event === "message.final");
+    expect(finalEvent?.data.text).toBe(reply);
+
+    // The transcript line is the placeholder; the provider body carries the
+    // decoded image in openai wire form (data: URL with the exact base64).
+    expect(mock.requests).toHaveLength(1);
+    expect(mock.requests[0].body).toContain("user: [Image]");
+    expect(mock.requests[0].body).toContain(`data:image/png;base64,${Buffer.from(bytes).toString("base64")}`);
+
+    // Persisted user message: placeholder text + the JSON blob-id refs.
+    const stored = db.select().from(messages).all();
+    expect(stored.map((row) => row.role)).toEqual(["user", "assistant"]);
+    expect(stored[0].text).toBe("[Image]");
+    expect(JSON.parse(stored[0].imageIds ?? "[]")).toEqual([uploaded.id]);
+    expect(stored[1].imageIds).toBeNull();
+
+    // History REST shows images [{id, mime}] on the user message only.
+    const history = await fetchHistory(app, user.token, threadId as string);
+    expect(history).toHaveLength(2);
+    expect(history[0]).toMatchObject({ role: "user", text: "[Image]", images: [uploaded] });
+    expect(history[1]).not.toHaveProperty("images");
+
+    // Absent `content` with imageIds is the SAME image-only shape: the frozen
+    // matrix says {content?|"", imageIds≤3} — absent is treated as "" (the
+    // placeholder text), not a 400.
+    const uploadedAgain = await uploadImage(app, user.token, imageBytes());
+    const absent = await postTurn(app, user.token, { imageIds: [uploadedAgain.id], threadId: threadId as string });
+    expect(absent.status).toBe(200);
+    const absentEvents = names(await readSse(absent).then((r) => r.events));
+    expect(absentEvents[absentEvents.length - 1]).toBe("turn.settled");
+    expect(absentEvents).not.toContain("error");
+    const rows = db.select().from(messages).all();
+    expect(rows.filter((row) => row.role === "user").map((row) => row.text)).toEqual(["[Image]", "[Image]"]);
+  }, 30_000);
+
+  it("text + two images on an existing thread: both ids stored in order, transcript keeps the text", async () => {
+    const { app, db } = makeApp();
+    const mock = await startMockOpenAI({ replyText: "Two pictures, one note." });
+    openMocks.push(mock);
+    const user = await registerUser(app, "gambar-teks");
+    seedConfig(db, user.userId, mock, "sk-live-gambar-teks-4444");
+    seedThread(db, user.userId, "thread-gambar-teks");
+    // Two separate uploads of the same real PNG: the engine inlines each
+    // attachment, so the wire carries TWO distinct data URLs.
+    const first = await uploadImage(app, user.token, imageBytes());
+    const second = await uploadImage(app, user.token, imageBytes());
+
+    const res = await postTurn(app, user.token, {
+      threadId: "thread-gambar-teks",
+      content: "Compare these two",
+      imageIds: [first.id, second.id],
+    });
+    expect(res.status).toBe(200);
+    const { events } = await readSse(res);
+    expect(names(events)).toEqual(expect.arrayContaining(["message.final", "turn.settled"]));
+
+    const stored = db.select().from(messages).all();
+    expect(stored.find((row) => row.role === "user")?.text).toBe("Compare these two");
+    expect(JSON.parse(stored.find((row) => row.role === "user")?.imageIds ?? "[]")).toEqual([first.id, second.id]);
+    expect(mock.requests[0].body).toContain("user: Compare these two");
+    const dataUrls = mock.requests[0].body.match(/data:image\/png;base64,/g) ?? [];
+    expect(dataUrls).toHaveLength(2);
+  }, 30_000);
+
+  it("foreign imageId vs unknown imageId: identical 404 envelopes, and nothing is written", async () => {
+    const { app, db } = makeApp();
+    const owner = await registerUser(app, "gambar-pemilik");
+    const stranger = await registerUser(app, "gambar-penginta");
+    const owned = await uploadImage(app, owner.token, imageBytes());
+
+    const foreign = await postTurn(app, stranger.token, { content: "mine?", imageIds: [owned.id] });
+    expect(foreign.status).toBe(404);
+    const unknown = await postTurn(app, stranger.token, { content: "mine?", imageIds: [ulid()] });
+    expect(unknown.status).toBe(404);
+
+    // Byte-identical bodies: no existence leak (same convention as audio/threads).
+    const foreignBody = await foreign.json();
+    const unknownBody = await unknown.json();
+    expect(foreignBody).toEqual({ error: { code: "not_found", message: expect.any(String) } });
+    expect(unknownBody).toEqual(foreignBody);
+
+    // Pre-write rejection: no thread, no message for the stranger.
+    expect(db.select().from(threads).all()).toEqual([]);
+    expect(db.select().from(messages).all()).toEqual([]);
+  });
+
+  it("imageIds validation: wrong shapes and caps are 400s; imageIds with audioId is 400; empty content without images stays 400", async () => {
+    const { app, db } = makeApp();
+    const user = await registerUser(app, "gambar-validasi");
+    const good = await uploadImage(app, user.token, imageBytes());
+
+    const cases: Array<Record<string, unknown>> = [
+      { imageIds: "not-an-array" },
+      { imageIds: [] },
+      { imageIds: [good.id, good.id, good.id, good.id] },
+      { imageIds: [42] },
+      { imageIds: [""] },
+      { imageIds: [good.id, null] },
+    ];
+    for (const body of cases) {
+      const res = await postTurn(app, user.token, body);
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      await expect(res.json()).resolves.toEqual({
+        error: { code: "invalid_request", message: expect.any(String) },
+      });
+    }
+
+    // The audio XOR still governs: imageIds rides the content path only.
+    const audioId = await uploadAudio(app, user.token, 900);
+    const withAudio = await postTurn(app, user.token, { audioId, imageIds: [good.id] });
+    expect(withAudio.status).toBe(400);
+    await expect(withAudio.json()).resolves.toEqual({
+      error: { code: "invalid_request", message: expect.stringContaining("imageIds") },
+    });
+
+    // Empty content with NO images remains the original 400.
+    const empty = await postTurn(app, user.token, { content: "" });
+    expect(empty.status).toBe(400);
+
+    // Everything above was rejected pre-write.
+    expect(db.select().from(threads).all()).toEqual([]);
+    expect(db.select().from(messages).all()).toEqual([]);
+  });
+});

@@ -2,6 +2,7 @@ import { serve } from "@hono/node-server";
 import { APP_NAME } from "../shared/app.ts";
 import { createApp } from "./app.ts";
 import { sweepOrphanAudioBlobs } from "./conversations/audio-gc.ts";
+import { sweepOrphanImageBlobs } from "./images/image-gc.ts";
 import { createDatabase, migrateDatabase, resolveDatabasePath } from "./db/index.ts";
 
 const DEFAULT_PORT = 3000;
@@ -26,6 +27,13 @@ migrateDatabase(db);
 const sweptOrphans = sweepOrphanAudioBlobs(db, Date.now());
 if (sweptOrphans > 0) {
   console.log(`Swept ${sweptOrphans} orphaned audio blob${sweptOrphans === 1 ? "" : "s"}.`);
+}
+
+// bot-tool-calling: the same one-shot sweep for image blobs (mirrored grace
+// window and boot choke point).
+const sweptImageOrphans = sweepOrphanImageBlobs(db, Date.now());
+if (sweptImageOrphans > 0) {
+  console.log(`Swept ${sweptImageOrphans} orphaned image blob${sweptImageOrphans === 1 ? "" : "s"}.`);
 }
 
 const app = createApp("dist", db);

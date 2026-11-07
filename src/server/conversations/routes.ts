@@ -9,6 +9,7 @@ import { SESSION_COOKIE } from "../auth/cookies.ts";
 import type { MessageDto, MessageRole, ThreadDto } from "../../shared/app.ts";
 import { listMessages, listThreads } from "./store.ts";
 import { getAudioById } from "../audio/store.ts";
+import { getImageById } from "../images/store.ts";
 import type { Message, Thread } from "../db/schema.ts";
 
 // REST baca riwayat percakapan (R2, AD-9): GET /api/threads (daftar milik
@@ -46,10 +47,15 @@ function toThreadDto(row: Thread): ThreadDto {
  * blob owner — the turn route only attaches blobs the session uploaded). A
  * blob that no longer resolves omits `audio` and keeps the stored placeholder
  * text — defensive: the GC sweep never deletes a referenced blob, but history
- * must not break if one ever goes missing.
+ * must not break if one ever goes missing. Images follow the same rule per id.
  */
 function toMessageDto(db: YuiDatabase, userId: string, row: Message): MessageDto {
   const blob = row.audioId === null ? null : getAudioById(db, userId, row.audioId);
+  const imageIds = parseImageIds(row.imageIds);
+  const images = imageIds
+    .map((id) => getImageById(db, userId, id))
+    .filter((image): image is NonNullable<typeof image> => image !== null)
+    .map((image) => ({ id: image.id, mime: image.mime }));
   return {
     id: row.id,
     role: row.role as MessageRole,
@@ -57,8 +63,21 @@ function toMessageDto(db: YuiDatabase, userId: string, row: Message): MessageDto
     ...(blob === null
       ? {}
       : { audio: { id: blob.id, mime: blob.mime, durationMs: blob.durationMs } }),
+    ...(images.length === 0 ? {} : { images }),
     createdAt: new Date(row.createdAt).toISOString(),
   };
+}
+
+/** Stored `messages.image_ids` JSON → string[]; anything malformed reads as none. */
+function parseImageIds(stored: string | null): string[] {
+  if (stored === null) return [];
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((id): id is string => typeof id === "string");
+  } catch {
+    return [];
+  }
 }
 
 /**

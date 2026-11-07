@@ -7,7 +7,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import type { Hono } from "hono";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
-import { audioBlobs, messages, threads, users } from "../db/schema.ts";
+import { audioBlobs, imageBlobs, messages, threads, users } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { registerUser } from "../../../tests/helpers/api.ts";
 
@@ -290,6 +290,61 @@ describe("GET /api/threads/:id/messages", () => {
     const dangling = (await after.json()) as Array<Record<string, unknown>>;
     expect(dangling[0]).not.toHaveProperty("audio");
     expect(dangling[0]).toMatchObject({ text: "[Voice note: 0:42]" });
+  });
+
+  it("image message maps images {id, mime} onto the DTO; a dangling blob id is dropped, never a 500", async () => {
+    const { app, db } = makeApp();
+    const user = await registerUser(app, "dto-gambar");
+    const base = Date.UTC(2026, 10, 7, 9, 0, 0);
+    const threadId = seedThread(db, user.userId, { createdAt: base, updatedAt: base });
+
+    const imageId = ulid();
+    db.insert(imageBlobs)
+      .values({
+        id: imageId,
+        ownerUserId: user.userId,
+        mime: "image/png",
+        blob: Buffer.alloc(32),
+        createdAt: base,
+      })
+      .run();
+    db.insert(messages)
+      .values({
+        id: "01MSG-IMAGE-USER",
+        threadId,
+        role: "user",
+        text: "[Image]",
+        imageIds: JSON.stringify([imageId]),
+        createdAt: base,
+      })
+      .run();
+    seedMessage(db, threadId, "assistant", "Nice picture.", base + 1_000);
+
+    const withBlob = await getMessages(app, user.token, threadId);
+    expect(withBlob.status).toBe(200);
+    const mapped = (await withBlob.json()) as Array<Record<string, unknown>>;
+    expect(mapped).toHaveLength(2);
+    expect(mapped[0]).toMatchObject({
+      id: "01MSG-IMAGE-USER",
+      role: "user",
+      text: "[Image]",
+      images: [{ id: imageId, mime: "image/png" }],
+    });
+    expect(mapped[1]).not.toHaveProperty("images");
+
+    // Blob gone from under the message: `images` is omitted and the stored
+    // placeholder text stays — history must not break on a dangling reference
+    // (image_ids is a JSON TEXT column with no FK; the route's null filter is
+    // the only guard). FK pragmas are untouched here — image_blobs has no FK
+    // into messages at all.
+    db.delete(imageBlobs).where(eq(imageBlobs.id, imageId)).run();
+
+    const after = await getMessages(app, user.token, threadId);
+    expect(after.status).toBe(200);
+    const dangling = (await after.json()) as Array<Record<string, unknown>>;
+    expect(dangling).toHaveLength(2);
+    expect(dangling[0]).not.toHaveProperty("images");
+    expect(dangling[0]).toMatchObject({ text: "[Image]" });
   });
 
   it("thread milik B diakses A → 404; thread tak ada → 404 IDENTIK; thread sah kosong → []", async () => {

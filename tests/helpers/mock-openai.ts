@@ -33,6 +33,14 @@ export type MockOpenAIOptions = {
   behavior?: MockBehavior;
   /** Jeda antar-chunk ms (default 15) — meniru laju streaming nyata. */
   chunkDelayMs?: number;
+  /** bot-tool-calling: the FIRST API call emits one tool_call (finish_reason
+   * "tool_calls") instead of plain text — the engine executes the tool and
+   * calls again, and the follow-up call streams the normal replyText. The
+   * tool arguments ride one whole delta (the engine parser accumulates
+   * `function.arguments` of any size). `textBefore`, when set, streams text
+   * content chunks BEFORE the tool_call — the narrating preamble of a tool
+   * turn. */
+  toolCall?: { name: string; arguments: Record<string, unknown>; textBefore?: string };
 };
 
 const CONTENT_CHUNK_CHARS = 12;
@@ -59,6 +67,10 @@ export function startMockOpenAI(options: MockOpenAIOptions = {}): Promise<MockOp
 
   const requests: MockRequest[] = [];
   const probes: MockRequest[] = [];
+  // API-call ordinal for the `toolCall` option: the scripted tool_call rides
+  // the FIRST provider call only; the engine's follow-up call gets the normal
+  // text stream.
+  let apiCalls = 0;
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -76,7 +88,10 @@ export function startMockOpenAI(options: MockOpenAIOptions = {}): Promise<MockOp
       // suffix cannot misfile a real call, and sub-paths (e.g. count_tokens)
       // stay out.
       const path = (req.url ?? "").split("?")[0]!;
+      let isApiCall = false;
       if (req.method === "POST" && path === "/v1/chat/completions") {
+        isApiCall = true;
+        apiCalls += 1;
         requests.push(record);
       } else {
         probes.push(record);
@@ -95,6 +110,32 @@ export function startMockOpenAI(options: MockOpenAIOptions = {}): Promise<MockOp
       });
 
       const model = "mock-model";
+      if (isApiCall && apiCalls === 1 && options.toolCall !== undefined) {
+        // Scripted tool call: optional text preamble first, then one
+        // tool_calls delta carrying the whole argument JSON, then
+        // finish_reason "tool_calls" — the wire shape the engine's
+        // openai-completions parser accumulates into a toolCall block.
+        const tool = options.toolCall;
+        if (tool.textBefore !== undefined && tool.textBefore.length > 0) {
+          res.write(`data: ${chunkPayload(model, { content: tool.textBefore }, null)}\n\n`);
+        }
+        res.write(
+          `data: ${chunkPayload(model, {
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_yui_mock_1",
+                type: "function",
+                function: { name: tool.name, arguments: JSON.stringify(tool.arguments) },
+              },
+            ],
+          }, null)}\n\n`,
+        );
+        res.write(`data: ${chunkPayload(model, {}, "tool_calls")}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
       const pieces = replyText.match(new RegExp(`.{1,${CONTENT_CHUNK_CHARS}}`, "g")) ?? [replyText];
       let index = 0;
       const timer = setInterval(() => {

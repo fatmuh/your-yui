@@ -224,6 +224,19 @@ export async function uploadAudioNote(
 }
 
 /**
+ * POST /api/images — store one image blob for the session user (multipart,
+ * 5 MB cap, `image/*` only enforced server-side) and get back `{id, mime}`.
+ * The id is what a turn's `imageIds` references.
+ */
+export async function uploadImage(blob: Blob): Promise<{ id: string; mime: string }> {
+  const form = new FormData();
+  form.set("file", new File([blob], "image", { type: blob.type }));
+  const response = await fetch("/api/images", { method: "POST", body: form });
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as { id: string; mime: string };
+}
+
+/**
  * GET /api/bots — the session user's bots, oldest first (BotDto[]). A user
  * without bots gets [] — the empty state, not an error.
  */
@@ -267,11 +280,14 @@ export async function deleteBot(id: string): Promise<void> {
  * in which case `botId` is REQUIRED (the server 400s without it and 404s on
  * a bot that is not the session user's). Exactly one of `content` (text) or
  * `audioId` (an uploaded voice note) is sent: the server enforces the XOR,
- * so this client always sends one and never both.
+ * so this client always sends one and never both. `imageIds` (1–3 uploaded
+ * image blobs) rides the content path only — with images attached the
+ * content may be an empty string.
  */
 export type StreamTurnInput = {
   content?: string;
   audioId?: string;
+  imageIds?: string[];
   threadId?: string;
   botId?: string;
   clientToken?: string;

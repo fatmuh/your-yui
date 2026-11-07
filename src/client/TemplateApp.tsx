@@ -15,7 +15,7 @@ import { useVoiceRecorder, voiceTime, type VoiceNote } from './useVoiceRecorder'
 import { VoiceNoteControls } from './VoiceNoteControls'
 import { VoiceCall } from './VoiceCall'
 import { useSession } from './SessionContext.tsx'
-import { ApiError, deleteBot, fetchThreadMessages, listBots, listThreads, resolveActiveKind, streamTurn, uploadAudioNote } from './api.ts'
+import { ApiError, deleteBot, fetchThreadMessages, listBots, listThreads, resolveActiveKind, streamTurn, uploadAudioNote, uploadImage } from './api.ts'
 import type { BotDto, MessageDto } from '../shared/app.ts'
 import type { YuiEvent } from '../shared/engine.ts'
 import './styles.css'
@@ -24,7 +24,7 @@ import './styles.css'
 // LAN http://<ip> ia undefined, jadi jatuh ke ulid agar id tetap tergenerasi.
 const newId = (): string => (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : ulid())
 
-type Message = { id: string; role: 'assistant' | 'user'; text: string; files?: string[]; audio?: { url: string; duration: number } }
+type Message = { id: string; role: 'assistant' | 'user'; text: string; files?: string[]; audio?: { url: string; duration: number }; images?: { url: string }[] }
 // Multi-bot harness: one conversation per bot. Before the bot's first turn
 // the id is the local placeholder `bot:<botId>` (server: false) and the turn
 // is sent WITHOUT threadId but WITH botId; the first thread.updated migrates
@@ -43,6 +43,48 @@ type Modal = 'apps' | 'create-bot' | 'settings' | null
 // the request with a clear message, not a security boundary — the server
 // rejects oversized blobs on its own (src/server/audio/routes.ts).
 const VOICE_NOTE_MAX_BYTES = 5 * 1024 * 1024
+
+// Same mirror for image attachments (server: src/server/images/routes.ts for
+// the 5 MB per-blob cap, engine route for the 3-per-turn cap).
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024
+const MAX_IMAGE_ATTACHMENTS = 3
+
+// Transient tool activity of the streaming turn (bot tool calling): what the
+// bot is doing with its fetch tools right now, shown as a chip in the typing
+// slot and cleared when the turn settles. Pure display state — never a
+// message, never persisted (AD-4: tool.activity is transient).
+export type ToolActivity = { chatId: string; tool: string; phase: 'start' | 'end'; detail?: string; isError?: boolean }
+
+/** Human label for one tool chip (allowlisted tools only; unknown names stay raw). */
+export function toolActivityLabel(activity: ToolActivity): string {
+  const what = activity.tool === 'view_image' ? 'Looking at an image' : activity.tool === 'web_fetch' ? 'Reading a web page' : `Using ${activity.tool}`
+  if (activity.phase === 'end') return activity.isError ? `${what} — unavailable` : what
+  return what
+}
+
+/**
+ * PURE tool-chip transition for one streamed event — the unit-tested core the
+ * wrapper's setToolActivity calls share (event stream, stream-failure catch,
+ * settled): `tool.activity` of THIS turn's conversation becomes the chip (a
+ * foreign thread's activity is ignored); `turn.settled` clears a chip scoped
+ * to this turn's conversation and leaves a foreign one alone; every other
+ * event returns the state untouched (same reference).
+ */
+export function nextToolActivity(
+  current: ToolActivity | null,
+  turn: { chatId: string; threadId?: string },
+  event: YuiEvent,
+): ToolActivity | null {
+  const turnChat = turn.threadId ?? turn.chatId
+  if (event.type === 'tool.activity') {
+    if (event.threadId !== turnChat) return current
+    return { chatId: event.threadId, tool: event.tool, phase: event.phase, detail: event.detail, isError: event.isError }
+  }
+  if (event.type === 'turn.settled') {
+    return current === null || current.chatId === turnChat ? null : current
+  }
+  return current
+}
 
 /** Conversation placeholder id for a bot whose thread is not created yet. */
 function botPlaceholderId(botId: string): string {
@@ -68,6 +110,11 @@ export function historyToClientMessages(messages: MessageDto[]): Message[] {
       // media request and the owner-scoped GET needs no token in the URL.
       client.audio = { url: `/api/audio/${encodeURIComponent(message.audio.id)}`, duration: message.audio.durationMs / 1000 }
     }
+    if (message.images !== undefined && message.images.length > 0) {
+      // Same owner-scoped relative URL convention as audio playback; the DTO
+      // drops unresolvable blobs server-side, so every id here renders.
+      client.images = message.images.map(image => ({ url: `/api/images/${encodeURIComponent(image.id)}` }))
+    }
     return client
   })
 }
@@ -83,7 +130,9 @@ export function historyToClientMessages(messages: MessageDto[]): Message[] {
  * arrived; the returned turn carries the thread id once the FIRST
  * thread.updated of a thread-creating turn reveals it. Events whose
  * conversation is gone (deleted mid-turn) leave the array reference
- * unchanged, so React skips the re-render.
+ * unchanged, so React skips the re-render. `tool.activity` and
+ * `turn.settled` are DEFAULT no-ops here — they touch no conversation rows;
+ * the wrapper routes them to the transient tool-chip state instead.
  */
 export function applyTurnEventToConversations(conversations: Conversation[], turn: TurnState, event: YuiEvent): { conversations: Conversation[]; turn: TurnState } {
   if (event.type === 'thread.updated') {
@@ -163,6 +212,10 @@ export default function App() {
   const [draft, setDraft] = useState('')
   const [files, setFiles] = useState<File[]>([])
   const [typingId, setTypingId] = useState<string | null>(null)
+  // Transient tool chip for the streaming turn (bot tool calling): same
+  // turn-scoped pattern as typingId — set on tool.activity events, cleared on
+  // turn.settled, never rendered outside its own conversation.
+  const [toolActivity, setToolActivity] = useState<ToolActivity | null>(null)
   // Assistant bubble currently growing from message.delta events of a server
   // turn — keyed by the event's messageId so cumulative text replaces in place.
   const streamingMessageRef = useRef<{ chatId: string; messageId: string } | null>(null)
@@ -189,12 +242,14 @@ export default function App() {
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const endRef = useRef<HTMLDivElement>(null)
-  const audioUrls = useRef(new Set<string>())
+  // Object URLs for optimistic media (voice notes + image attachments) —
+  // revoked on unmount so no blob URL outlives the session.
+  const blobUrls = useRef(new Set<string>())
   const voice = useVoiceRecorder(active?.id ?? '', sendServerVoiceNote)
   const voiceActive = voice.phase !== 'idle'
   const voiceStatus = voice.phase === 'recording' ? 'Recording voice note. Stop to send, or cancel.' : voice.phase === 'requesting' ? 'Waiting for microphone permission. Allow access in your browser, or cancel.' : voice.phase === 'stopping' ? 'Preparing voice note.' : ''
 
-  useEffect(() => () => audioUrls.current.forEach(url => URL.revokeObjectURL(url)), [])
+  useEffect(() => () => blobUrls.current.forEach(url => URL.revokeObjectURL(url)), [])
 
   // Mount: build the bot conversations. GET /api/bots owns the roster (oldest
   // first = shortcut row order); GET /api/threads (newest first) binds each
@@ -250,7 +305,7 @@ export default function App() {
       return
     }
     const url = URL.createObjectURL(note.blob)
-    audioUrls.current.add(url)
+    blobUrls.current.add(url)
     const message: Message = { id: newId(), role: 'user', text: `Voice note · ${voiceTime(note.duration)}`, audio: { url, duration: note.duration } }
     setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: [...chat.messages, message] } : chat))
     setTypingId(chatId)
@@ -264,7 +319,7 @@ export default function App() {
         // composer under that stream.
         setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: chat.messages.filter(item => item.id !== message.id) } : chat))
         URL.revokeObjectURL(url)
-        audioUrls.current.delete(url)
+        blobUrls.current.delete(url)
         setTypingId(current => current === chatId ? null : current)
         setNotice(error instanceof ApiError ? error.message : 'Could not upload the voice note. Try again.')
         requestAnimationFrame(() => inputRef.current?.focus())
@@ -467,7 +522,8 @@ export default function App() {
     void deleteBot(target.botId)
       .then(() => {
         conversations.find(chat => chat.id === target.id)?.messages.forEach(message => {
-          if (message.audio) { URL.revokeObjectURL(message.audio.url); audioUrls.current.delete(message.audio.url) }
+          if (message.audio) { URL.revokeObjectURL(message.audio.url); blobUrls.current.delete(message.audio.url) }
+          message.images?.forEach(image => { if (blobUrls.current.has(image.url)) { URL.revokeObjectURL(image.url); blobUrls.current.delete(image.url) } })
         })
         const remaining = conversations.filter(chat => chat.id !== target.id)
         setConversations(remaining)
@@ -540,56 +596,126 @@ export default function App() {
       streamingMessageRef.current = { chatId: event.threadId, messageId: event.messageId }
       return
     }
+    if (event.type === 'tool.activity') {
+      // Transient chip state, never a message: only events of THIS turn's
+      // conversation land in state — a foreign thread's activity is ignored.
+      setToolActivity(current => nextToolActivity(current, turn, event))
+      return
+    }
     // turn.settled is always the last event: release the composer — but only
     // when typingId still points at THIS turn's conversation, so a stale turn
-    // cannot unblock the composer while a newer one is still streaming.
+    // cannot unblock the composer while a newer one is still streaming. The
+    // tool chip clears with the same turn-scoped guard.
     streamingMessageRef.current = null
     setTypingId(current => current === (turn.threadId ?? turn.chatId) ? null : current)
+    setToolActivity(current => nextToolActivity(current, turn, event))
   }
 
   // Server turn for the active bot: optimistic user bubble → POST
   // /api/engine/turn → streamed events grow the assistant bubble in place.
   // A placeholder conversation (no thread yet) sends botId and no threadId —
   // the server creates the thread bound to that bot; a server conversation
-  // sends threadId only (the thread's own bot governs the turn).
+  // sends threadId only (the thread's own bot governs the turn). With image
+  // attachments the flow grows one stage: optimistic thumbnails → upload each
+  // blob → the turn carries `imageIds` alongside the text (which may be empty
+  // — the server stores a placeholder then).
   function sendServerMessage(text: string) {
     const chat = active
     if (chat === undefined) return
-    if (!text) {
-      // The server demands non-empty content; attachments alone stay local.
+    const attachments = files
+    if (!text && attachments.length === 0) {
+      // The server demands content XOR an attachment; nothing to send.
       setNotice('Type a message to send')
       return
     }
     const chatId = chat.id
     const turn: TurnState = { chatId, threadId: chat.server === true ? chatId : undefined }
-    const message: Message = { id: newId(), role: 'user', text, files: files.map(file => file.name) }
+    const urls = attachments.map(file => URL.createObjectURL(file))
+    urls.forEach(url => blobUrls.current.add(url))
+    const message: Message = {
+      id: newId(),
+      role: 'user',
+      text,
+      ...(attachments.length > 0 ? { images: urls.map(url => ({ url })), files: attachments.map(file => file.name) } : {}),
+    }
     setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: [...chat.messages, message] } : chat))
     setDraft('')
     setFiles([])
     setTypingId(chatId)
-    // The active kind resolves per-send (two parallel GETs), so a config saved
-    // moments ago in Settings applies to this turn without a reload. Resolution
-    // failure never blocks the turn: it goes out without `kind` and the server's
-    // own response tells the story.
-    void resolveActiveKind()
-      .catch(() => null)
-      .then(kind => streamTurn({ content: text, threadId: turn.threadId, botId: chat.server === true ? undefined : chat.botId, clientToken: newId(), kind: kind ?? undefined }, event => applyTurnEvent(turn, event)))
-      .catch((error: unknown) => {
+    // Stage marker for the failure path below: until every upload has landed
+    // nothing was ever sent, so a rejection there must also remove the
+    // optimistic bubble and revoke its object URLs (voice-flow mirror).
+    let uploadsSettled = false
+    void (async () => {
+      try {
+        // Upload first — a rejected image (oversize, session gone) never
+        // starts a turn.
+        const imageIds = await Promise.all(attachments.map(file => uploadImage(file).then(uploaded => uploaded.id)))
+        uploadsSettled = true
+        // The active kind resolves per-send (two parallel GETs), so a config
+        // saved moments ago in Settings applies to this turn without a reload.
+        // Resolution failure never blocks the turn: it goes out without
+        // `kind` and the server's own response tells the story.
+        const kind = await resolveActiveKind().catch(() => null)
+        await streamTurn(
+          {
+            content: text,
+            ...(imageIds.length > 0 ? { imageIds } : {}),
+            threadId: turn.threadId,
+            botId: chat.server === true ? undefined : chat.botId,
+            clientToken: newId(),
+            kind: kind ?? undefined,
+          },
+          event => applyTurnEvent(turn, event),
+        )
+      } catch (error: unknown) {
         // Pre-stream rejection or mid-stream failure: release the composer and
         // surface a notice — turn-scoped, so a stale turn's rejection cannot
         // release a newer turn still streaming. The optimistic user bubble
-        // stays (v1 has no auto-retry); an in-progress bubble keeps its last text.
+        // stays (v1 has no auto-retry); an in-progress bubble keeps its last
+        // text — EXCEPT when the failure happened during upload (nothing was
+        // sent at all): the bubble goes away and its object URLs are revoked.
+        if (!uploadsSettled) {
+          setConversations(current => current.map(item => item.id === chatId ? { ...item, messages: item.messages.filter(candidate => candidate.id !== message.id) } : item))
+          urls.forEach(url => { URL.revokeObjectURL(url); blobUrls.current.delete(url) })
+        }
         streamingMessageRef.current = null
         setTypingId(current => current === (turn.threadId ?? turn.chatId) ? null : current)
+        // Same turn-scoped chip reset as the settled path — without it a stale
+        // tool chip would reappear for this chat's next turn.
+        setToolActivity(current => nextToolActivity(current, turn, { type: 'turn.settled', threadId: turn.threadId ?? turn.chatId }))
         if (error instanceof ApiError && error.code === 'unauthorized') setNotice('Session expired. Sign in again.')
         else if (error instanceof ApiError) setNotice(error.message)
         else setNotice('Could not reach the bot. Check your connection and try again.')
-      })
+      }
+    })()
   }
 
   function sendMessage() {
     const text = draft.trim()
     if ((!text && files.length === 0) || typingId || voiceActive) return
+    // Client-side image guards (the server re-validates everything): picker
+    // is accept="image/*" but a drag-in or picker bypass still lands here.
+    if (files.some(file => !file.type.startsWith('image/'))) {
+      setNotice('Only image attachments are supported.')
+      return
+    }
+    if (files.some(file => file.type === 'image/svg+xml')) {
+      setNotice('SVG images are not supported.')
+      return
+    }
+    if (files.some(file => file.size === 0)) {
+      setNotice('One of the images is empty.')
+      return
+    }
+    if (files.length > MAX_IMAGE_ATTACHMENTS) {
+      setNotice(`Up to ${MAX_IMAGE_ATTACHMENTS} images per message.`)
+      return
+    }
+    if (files.some(file => file.size > IMAGE_MAX_BYTES)) {
+      setNotice('One of the images is over 5 MB. Attach a smaller one.')
+      return
+    }
     sendServerMessage(text)
   }
 
@@ -641,9 +767,10 @@ export default function App() {
         <div className="messages flex flex-col items-start gap-4">
           {active.messages.map(message => <div key={message.id} className={`message-bubble animate-message whitespace-pre-wrap break-words ${message.role === 'user' ? 'message-user self-end' : 'message-assistant'}`}>
             {message.audio ? <div className="voice-message"><span className="voice-message-label">{message.text}</span><audio controls preload="metadata" src={message.audio.url} aria-label={`Play voice note, ${voiceTime(message.audio.duration)}`} /><span className="voice-message-label">Voice note</span></div> : message.text}
+            {!!message.images?.length && <div className="message-images mt-2 flex flex-wrap gap-2">{message.images.map((image, index) => <img key={`${image.url}-${index}`} src={image.url} alt="Attached image" loading="lazy" className="message-image" />)}</div>}
             {!!message.files?.length && <div className="mt-2 flex flex-wrap gap-2">{message.files.map((file, index) => <span key={`${file}-${index}`} className="inline-flex max-w-full items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm"><FileText size={16} className="shrink-0" /><span className="attachment-name">{file}</span></span>)}</div>}
           </div>)}
-          {typingId === active.id && <div className="typing-indicator flex items-center gap-3 pl-3 text-[#777777]" role="status"><Avatar variant="yui" className="typing-avatar" /><span>Typing<span className="typing-dots">...</span></span></div>}
+          {typingId === active.id && <div className="typing-indicator flex items-center gap-3 pl-3 text-[#777777]" role="status"><Avatar variant="yui" className="typing-avatar" /><span>Typing<span className="typing-dots">...</span></span>{toolActivity?.chatId === active.id && <span className="tool-chip">{toolActivityLabel(toolActivity)}</span>}</div>}
           <div ref={endRef} />
         </div>
       </section>}
@@ -654,8 +781,8 @@ export default function App() {
         <div className="sr-only" role="status">{voiceStatus}</div>
         <form className="composer flex items-end gap-3 rounded-[32px] border border-[#484848] bg-[#202020]" onSubmit={event => { event.preventDefault(); sendMessage() }}>
           {voiceActive ? <VoiceNoteControls voice={voice} onCancel={cancelVoice} /> : <>
-          <input ref={fileRef} type="file" multiple className="hidden" aria-label="Attach files" onChange={event => { setFiles(current => [...current, ...Array.from(event.target.files ?? [])]); event.target.value = ''; inputRef.current?.focus() }} />
-          <button type="button" className="composer-icon attachment-button" aria-label="Attach files (local preview only)" title="Attach files (local preview only)" onClick={() => fileRef.current?.click()}><Plus strokeWidth={2.2} /></button>
+          <input ref={fileRef} type="file" multiple accept="image/*" className="hidden" aria-label="Attach images" onChange={event => { setFiles(current => [...current, ...Array.from(event.target.files ?? [])]); event.target.value = ''; inputRef.current?.focus() }} />
+          <button type="button" className="composer-icon attachment-button" aria-label="Attach images" title="Attach images" onClick={() => fileRef.current?.click()}><Plus strokeWidth={2.2} /></button>
           <label htmlFor="message-input" className="sr-only">Message {active.botName}</label>
           <textarea id="message-input" name="message" ref={inputRef} className="message-input min-w-0 flex-1 resize-none bg-transparent outline-none placeholder:text-[#737373]" rows={1} spellCheck={spellCheck} aria-label={`Message ${active.botName}`} placeholder={`Message ${active.botName}`} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); sendMessage() } }} />
           <div className="flex shrink-0 items-center gap-3">
