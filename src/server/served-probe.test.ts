@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,6 +29,9 @@ const DISPOSABLE_KEK = randomBytes(32).toString("base64");
 // `sk-…wxyz` (prefiks 3 + elipsis + 4 terakhir, konvensi crypto.ts).
 const OPENAI_API_KEY = "sk-live-served-aaaabbbbccccabcd";
 const ANTHROPIC_API_KEY = "sk-ant-served-11112222wxyz";
+// Second-account key for the final-verification describe (ends "wxyz"): a
+// distinct plaintext that must satisfy the SAME audit nets as the two above.
+const BOB_API_KEY = "sk-live-bob-final-4242eeeewxyz";
 
 const JSON_HEADERS = { "content-type": "application/json" };
 
@@ -295,6 +298,7 @@ afterAll(async () => {
     // terakumulasi lintas spawn → audit ini meliputi SEMUA anak proses.
     expect(childOutput).not.toContain(OPENAI_API_KEY);
     expect(childOutput).not.toContain(ANTHROPIC_API_KEY);
+    expect(childOutput).not.toContain(BOB_API_KEY);
   }
   while (openMocks.length > 0) {
     await openMocks.pop()?.close();
@@ -307,6 +311,7 @@ afterAll(async () => {
   for (const body of responseBodies) {
     expect(body).not.toContain(OPENAI_API_KEY);
     expect(body).not.toContain(ANTHROPIC_API_KEY);
+    expect(body).not.toContain(BOB_API_KEY);
   }
 }, 15_000);
 
@@ -1235,5 +1240,152 @@ describe("served build — session revocation closes the active SSE turn", () =>
     // The overwritten config took effect: exactly one call hit the FAST mock.
     expect(fastMock.requests).toHaveLength(1);
     expect(fastMock.requests[0].authorization).toBe(`Bearer ${OPENAI_API_KEY}`);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// epic-pwa ticket 3 — final integrated verification of the initiative on the
+// served build: (1) AT-REST CIPHERTEXT — after a full turn that provably ran
+// the decrypt path, NO yui.db* file on disk ever contains the plaintext key,
+// while the API still serves the masked hint; (2) CROSS-USER CREDENTIAL
+// ISOLATION — bob's GET/PUT/DELETE on his own config never reads, overwrites,
+// or deletes alice's row. This describe manages the module-level child itself
+// (stop → reserve port AFTER the stop → spawn), exactly like the describes
+// above; declaration order is the contract, so the swap cannot disturb any
+// test above.
+// ---------------------------------------------------------------------------
+describe("served build — final integrated verification: at-rest ciphertext, credential isolation", () => {
+  // State shared by the two tests below (declaration order is the contract):
+  // test 1 sets the fresh at-rest user's cookie and mock; test 2 guards on both.
+  let aliceCookie = "";
+  let atRestMock: MockOpenAI | null = null;
+
+  // Alice stores the module OPENAI_API_KEY (ends "abcd" → mask "sk-…abcd").
+  // Bob stores the module BOB_API_KEY (ends "wxyz" → mask "sk-…wxyz";
+  // crypto.ts convention: first 3 chars + ellipsis + last 4).
+  const atRestReply =
+    "Served final verification reply: the at-rest scan runs after this full turn.";
+
+  it("at-rest ciphertext only: full turn through the decrypt path, masked hint served, plaintext absent from every yui.db* file", async () => {
+    // Fresh child for this describe (same pattern as the describes above).
+    if (child === null) throw new Error("served child missing — test order broken");
+    await stopChild(child);
+    const finalPort = await reservePort();
+    child = await spawnServed(finalPort);
+    baseUrl = `http://127.0.0.1:${finalPort}`;
+
+    atRestMock = await startMockOpenAI({ replyText: atRestReply });
+    openMocks.push(atRestMock);
+    const mock: MockOpenAI = atRestMock;
+    aliceCookie = await registerUser("probe-atrest");
+
+    // Encrypt-then-store happens in the CHILD via the story-3 route; the
+    // response view carries the mask only, never the raw key.
+    const put = await putConfig(aliceCookie, "openai-compatible", {
+      apiKey: OPENAI_API_KEY,
+      baseUrl: mock.baseUrl,
+      modelId: "mock-model",
+    });
+    expect(put.kind).toBe("openai-compatible");
+    expect(put.maskedHint).toBe("sk-…abcd");
+    expect(JSON.stringify(put)).not.toContain(OPENAI_API_KEY);
+
+    // A FULL turn proves the decrypt path really ran in the child: the stream
+    // satisfies the complete event contract and the mock saw the PUT key on
+    // the wire (decryption happened server-side before the provider call).
+    const turn = await postTurn(aliceCookie, {
+      content: "Served final verification marker 7k2q",
+      clientToken: "tok-served-final",
+    });
+    assertFullContract(turn.events, {
+      threadId: threadIdFromEvents(turn.events),
+      clientToken: "tok-served-final",
+      reply: atRestReply,
+    });
+    expect(mock.requests).toHaveLength(1);
+    expect(mock.requests[0].authorization).toBe(`Bearer ${OPENAI_API_KEY}`);
+
+    // The API still serves the credential — but only as the masked hint.
+    const view = await getConfig(aliceCookie, "openai-compatible");
+    expect(view.maskedHint).toBe("sk-…abcd");
+    expect(JSON.stringify(view)).not.toContain(OPENAI_API_KEY);
+
+    // AT-REST SCAN: WAL is ON, so live rows may sit in yui.db-wal instead of
+    // (or in addition to) yui.db — scan EVERY yui.db* file that exists right
+    // now, as raw bytes. Plaintext never touching disk means it cannot appear
+    // in any of them; the at-rest format is base64 `iv:tag:ct` ciphertext.
+    const dbFiles = readdirSync(DATA_DIR).filter((name) => name.startsWith("yui.db"));
+    expect(dbFiles).toContain("yui.db");
+    for (const name of dbFiles) {
+      const bytes = readFileSync(join(DATA_DIR, name));
+      expect(bytes.indexOf(OPENAI_API_KEY)).toBe(-1);
+    }
+  }, 60_000);
+
+  it("cross-user credential isolation: bob's GET/PUT/DELETE never reach or change alice's row", async () => {
+    if (aliceCookie === "" || atRestMock === null) {
+      throw new Error("at-rest alice state missing — test order broken");
+    }
+
+    const bobCookie = await registerUser("probe-atrest-bob");
+
+    // Door (a) — bob GETs the kind alice owns → 404; the RAW body must be
+    // byte-identical to alice GETting a kind nobody ever stored (comparing
+    // the two 404 doors as strings — no existence leak, same envelope).
+    const bobMissing = await fetch(`${baseUrl}/api/provider-configs/openai-compatible`, {
+      headers: { cookie: bobCookie },
+    });
+    const bobMissingText = await bobMissing.text();
+    responseBodies.push(bobMissingText);
+    expect(bobMissing.status).toBe(404);
+
+    const aliceAbsent = await fetch(`${baseUrl}/api/provider-configs/anthropic`, {
+      headers: { cookie: aliceCookie },
+    });
+    const aliceAbsentText = await aliceAbsent.text();
+    responseBodies.push(aliceAbsentText);
+    expect(aliceAbsent.status).toBe(404);
+
+    expect(bobMissingText).toBe(aliceAbsentText);
+    expect(JSON.parse(bobMissingText)).toMatchObject({ error: { code: "not_found" } });
+
+    // Door (b) — bob PUTs HIS OWN config with a DIFFERENT key → 200 with HIS
+    // hint; alice's stored row is untouched (write independence).
+    const bobPut = await putConfig(bobCookie, "openai-compatible", {
+      apiKey: BOB_API_KEY,
+      baseUrl: atRestMock.baseUrl,
+      modelId: "mock-model",
+    });
+    expect(bobPut.maskedHint).toBe("sk-…wxyz");
+    expect(JSON.stringify(bobPut)).not.toContain(BOB_API_KEY);
+
+    const aliceAfterBobPut = await getConfig(aliceCookie, "openai-compatible");
+    expect(aliceAfterBobPut.maskedHint).toBe("sk-…abcd");
+    expect(JSON.stringify(aliceAfterBobPut)).not.toContain(OPENAI_API_KEY);
+    expect(JSON.stringify(aliceAfterBobPut)).not.toContain(BOB_API_KEY);
+
+    // Bob's row is now on disk too — his plaintext must be just as absent
+    // from every yui.db* file as alice's (the test-1 scan predates his PUT).
+    for (const name of readdirSync(DATA_DIR).filter((entry) => entry.startsWith("yui.db"))) {
+      expect(readFileSync(join(DATA_DIR, name)).indexOf(BOB_API_KEY)).toBe(-1);
+    }
+
+    // Door (c) — bob DELETES his own config → 204, then his own GET is 404,
+    // while alice's row survives with her own hint (delete independence).
+    const bobDelete = await requestJson("/api/provider-configs/openai-compatible", {
+      method: "DELETE",
+      headers: { cookie: bobCookie },
+    });
+    expect(bobDelete.status).toBe(204);
+
+    const bobAfterDelete = await requestJson("/api/provider-configs/openai-compatible", {
+      headers: { cookie: bobCookie },
+    });
+    expect(bobAfterDelete.status).toBe(404);
+    expect(bobAfterDelete.body).toMatchObject({ error: { code: "not_found" } });
+
+    const aliceAfterBobDelete = await getConfig(aliceCookie, "openai-compatible");
+    expect(aliceAfterBobDelete.maskedHint).toBe("sk-…abcd");
+    expect(JSON.stringify(aliceAfterBobDelete)).not.toContain(OPENAI_API_KEY);
   }, 60_000);
 });
