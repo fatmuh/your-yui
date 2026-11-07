@@ -23,6 +23,7 @@ import {
 
 const MAX_API_KEY_CHARS = 4_096;
 const MAX_MODEL_ID_CHARS = 200;
+const MAX_BASE_URL_CHARS = 2_048;
 
 type ErrorCode = "unauthorized" | "invalid_request" | "not_found";
 
@@ -87,21 +88,29 @@ function parseConfigBody(kind: ProviderKind, body: unknown): ParseResult {
 
   let parsedBaseUrl: string | null = null;
   if (baseUrl !== undefined && baseUrl !== null) {
-    if (typeof baseUrl !== "string" || !isHttpUrl(baseUrl)) {
+    if (
+      typeof baseUrl !== "string" ||
+      baseUrl.length > MAX_BASE_URL_CHARS ||
+      !isHttpUrl(baseUrl)
+    ) {
       return {
         ok: false,
-        message: '"baseUrl", when present, must be a valid http(s) URL.',
+        message: `"baseUrl", when present, must be a valid http(s) URL of at most ${MAX_BASE_URL_CHARS} characters.`,
       };
     }
     parsedBaseUrl = baseUrl;
   }
 
   let parsedModelId: string | null = null;
-  if (modelId !== undefined && modelId !== null && modelId !== "") {
-    if (typeof modelId !== "string" || modelId.length > MAX_MODEL_ID_CHARS) {
+  if (modelId !== undefined && modelId !== null) {
+    if (
+      typeof modelId !== "string" ||
+      modelId.length === 0 ||
+      modelId.length > MAX_MODEL_ID_CHARS
+    ) {
       return {
         ok: false,
-        message: `"modelId", when present, must be a string of at most ${MAX_MODEL_ID_CHARS} characters.`,
+        message: `"modelId", when present, must be a non-empty string of at most ${MAX_MODEL_ID_CHARS} characters.`,
       };
     }
     parsedModelId = modelId;

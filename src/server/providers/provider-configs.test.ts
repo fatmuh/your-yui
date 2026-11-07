@@ -195,12 +195,20 @@ describe("PUT /api/provider-configs/:kind", () => {
     expect(second.status).toBe(200);
     const secondBody = (await second.json()) as Record<string, unknown>;
 
-    expect(db.select().from(providerConfigs).all()).toHaveLength(1);
     expect(secondBody.maskedHint).toBe(maskSecret(secondKey));
     expect(secondBody.maskedHint).not.toBe(firstBody.maskedHint);
     expect(secondBody.baseUrl).toBe("http://127.0.0.1:10/v1");
     expect(secondBody.createdAt).toBe(firstBody.createdAt);
     expect(secondBody.updatedAt).toMatch(ISO_UTC);
+
+    // Level baris DB, bukan hanya respons: respons PUT dibangun dari nilai
+    // input, jadi bila klausa set onConflict membuang maskedHint, DB tetap
+    // menyimpan mask kunci LAMA sementara respons terlihat benar — GET
+    // berikutnya akan menampilkan sk-…abcd kredensial sebelumnya.
+    const rows = db.select().from(providerConfigs).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.maskedHint).toBe(maskSecret(secondKey));
+    expect(rows[0]!.maskedHint).not.toBe(maskSecret(OPENAI_BODY.apiKey));
   });
 });
 
@@ -330,7 +338,14 @@ describe("validasi ditolak pra-tulis", () => {
       },
       { label: "baseUrl bukan http(s)", method: "PUT", kind: "openai-compatible", body: { ...OPENAI_BODY, baseUrl: "ftp://example.com/v1" } },
       { label: "baseUrl bukan URL", method: "PUT", kind: "openai-compatible", body: { ...OPENAI_BODY, baseUrl: "bukan-url" } },
+      {
+        label: "baseUrl > 2048",
+        method: "PUT",
+        kind: "openai-compatible",
+        body: { ...OPENAI_BODY, baseUrl: `http://127.0.0.1:9/v1${"a".repeat(2_100)}` },
+      },
       { label: "modelId > 200", method: "PUT", kind: "openai-compatible", body: { ...OPENAI_BODY, modelId: "m".repeat(201) } },
+      { label: "modelId string kosong", method: "PUT", kind: "anthropic", body: { ...validKey, modelId: "" } },
     ];
 
     for (const { label, method, kind, body } of cases) {
