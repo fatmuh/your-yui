@@ -41,6 +41,16 @@ export function createApp(staticRoot = "dist", db?: YuiDatabase) {
     app.route("/api", audioRoutes(db));
   }
 
+  // PWA (epic-pwa): the service worker script must always be revalidated.
+  // The service-worker spec lets a browser keep an HTTP-cache-fresh sw.js for
+  // up to 24 hours, which would pin installed clients to the old precached
+  // shell after a deploy. Static-asset serving concern only — /sw.js exists
+  // solely in the built dist/ output and shares nothing with /api/*.
+  app.use("/sw.js", async (c, next) => {
+    await next();
+    c.res.headers.set("Cache-Control", "no-cache");
+  });
+
   // Production: serve the built client shell from dist/. Before `npm run build`
   // has run, these paths 404 — during development vite serves the shell instead.
   app.use("*", serveStatic({ root: staticRoot }));

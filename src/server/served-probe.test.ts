@@ -890,3 +890,147 @@ describe("served build — voice end-to-end: upload, turn, history, playback, is
     expect(messages[3]).toMatchObject({ role: "assistant", text: voiceReply });
   }, 60_000);
 });
+
+// ---------------------------------------------------------------------------
+// epic-pwa ticket 1 — PWA assets on the served build: the web app manifest,
+// the three icons it references, the static-only service worker, and the
+// shell's manifest link. Pure static assets: no provider mocks, no accounts,
+// and this describe swaps in its own served child exactly like the restart
+// tests above (stop → reserve port AFTER the stop → spawn). Declaration order
+// is the contract, so the swap cannot disturb any test above.
+// ---------------------------------------------------------------------------
+describe("served build — PWA assets: manifest, service worker, icons", () => {
+  // Set by the first test (declaration order); the later tests guard on it.
+  let assetsReady = false;
+
+  /**
+   * Guard for the follower tests: skip when the tree has no build output at
+   * all (the same local-without-`npm run build` escape hatch the first
+   * describe's probe uses), fail when the assets exist but the first test
+   * never ran its child swap (order broken).
+   */
+  function requireAssetsOrSkip(ctx: { skip: (reason: string) => void }): void {
+    if (assetsReady) return;
+    if (!existsSync(join(REPO_ROOT, "dist", "manifest.webmanifest"))) {
+      ctx.skip("dist/manifest.webmanifest absent — run `npm run build` (CI always builds before test)");
+    }
+    throw new Error("pwa asset state missing — test order broken");
+  }
+
+  type ManifestIcon = { src: string; sizes: string; type: string; purpose: string };
+  type WebManifest = {
+    name: string;
+    short_name: string;
+    display: string;
+    theme_color: string;
+    start_url: string;
+    icons: ManifestIcon[];
+  };
+
+  it("manifest: Yui identity, standalone display, #111111 theme, and all three icon variants", async (ctx) => {
+    // Same local-without-build escape hatch as the first describe's probe:
+    // CI always runs typecheck → build → test, so the assertions are live there.
+    if (!existsSync(join(REPO_ROOT, "dist", "manifest.webmanifest"))) {
+      ctx.skip("dist/manifest.webmanifest absent — run `npm run build` (CI always builds before test)");
+    }
+
+    // Fresh child for static assets only, managed here like the restart tests.
+    if (child === null) throw new Error("served child missing — test order broken");
+    await stopChild(child);
+    const pwaPort = await reservePort();
+    child = await spawnServed(pwaPort);
+    baseUrl = `http://127.0.0.1:${pwaPort}`;
+    assetsReady = true;
+
+    const res = await fetch(`${baseUrl}/manifest.webmanifest`);
+    const text = await res.text();
+    responseBodies.push(text);
+    expect(res.status).toBe(200);
+    // No strict content-type here: the static file server may or may not map
+    // .webmanifest to application/manifest+json — a 200 with parseable JSON
+    // carrying the right fields is the contract that matters.
+    const manifest = JSON.parse(text) as WebManifest;
+    expect(manifest.name).toBe("Yui");
+    expect(manifest.short_name).toBe("Yui");
+    expect(manifest.display).toBe("standalone");
+    expect(manifest.theme_color).toBe("#111111");
+    expect(manifest.start_url).toBe("/");
+    expect(manifest.icons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sizes: "192x192", type: "image/png", purpose: "any" }),
+        expect.objectContaining({ sizes: "512x512", type: "image/png", purpose: "any" }),
+        expect.objectContaining({ sizes: "512x512", type: "image/png", purpose: "maskable" }),
+      ]),
+    );
+  }, 60_000);
+
+  it("icons: every manifest src serves real PNG bytes (magic header, image/png, non-empty)", async (ctx) => {
+    requireAssetsOrSkip(ctx);
+
+    // Re-read the manifest over HTTP (state stays self-contained per test) and
+    // fetch each icon src it advertises, prefixed with "/".
+    const manifestRes = await fetch(`${baseUrl}/manifest.webmanifest`);
+    const manifestText = await manifestRes.text();
+    responseBodies.push(manifestText);
+    expect(manifestRes.status).toBe(200);
+    const { icons } = JSON.parse(manifestText) as WebManifest;
+    expect(icons.length).toBeGreaterThanOrEqual(3);
+
+    for (const icon of icons) {
+      const src = icon.src.startsWith("/") ? icon.src : `/${icon.src}`;
+      const iconRes = await fetch(`${baseUrl}${src}`);
+      const bytes = Buffer.from(await iconRes.arrayBuffer());
+      // Binary body recorded for the R2 audit via utf8 decode — the same
+      // convention the audio playback helper above established.
+      responseBodies.push(bytes.toString("utf8"));
+      expect(iconRes.status).toBe(200);
+      expect(iconRes.headers.get("content-type")).toMatch(/^image\/png/);
+      expect(bytes.length).toBeGreaterThan(0);
+      // PNG magic bytes: 0x89 'P' 'N' 'G'.
+      expect([...bytes.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    }
+  }, 60_000);
+
+  it("service worker: precache live, EXACTLY ONE registerRoute — a NavigationRoute denying /api", async (ctx) => {
+    requireAssetsOrSkip(ctx);
+
+    const res = await fetch(`${baseUrl}/sw.js`);
+    const text = await res.text();
+    responseBodies.push(text);
+    expect(res.status).toBe(200);
+    // Always-revalidate: without Cache-Control: no-cache a browser may keep an
+    // HTTP-cache-fresh sw.js for up to 24h and pin the old precached shell.
+    expect(res.headers.get("cache-control")).toContain("no-cache");
+
+    // Precache is live (the shell + assets are precached, not runtime-cached).
+    expect(text).toContain("precacheAndRoute");
+
+    // AD-10 by construction: the ONLY route registration is the navigation
+    // fallback — a second registerRoute would mean a runtime caching route.
+    expect(text.match(/registerRoute\(/g)).toHaveLength(1);
+    expect(text).toContain("NavigationRoute");
+
+    // The navigation fallback targets the shell and denies /api/*. Pinned to
+    // the ACTUAL workbox generateSW serialization observed in dist/sw.js:
+    //   e.registerRoute(new e.NavigationRoute(e.createHandlerBoundToURL(
+    //     "index.html"), { denylist: [/^\/api\//] }))
+    // Only the data literals are pinned — the minified binding name is not.
+    expect(text).toContain('createHandlerBoundToURL("index.html")');
+    expect(text).toContain("denylist:[/^\\/api\\//]");
+  }, 60_000);
+
+  it("shell regression: GET / references the manifest link; /favicon.svg still serves", async (ctx) => {
+    requireAssetsOrSkip(ctx);
+
+    const shellRes = await fetch(`${baseUrl}/`);
+    const shell = await shellRes.text();
+    responseBodies.push(shell);
+    expect(shellRes.status).toBe(200);
+    expect(shell).toContain('rel="manifest"');
+
+    const faviconRes = await fetch(`${baseUrl}/favicon.svg`);
+    const favicon = await faviconRes.text();
+    responseBodies.push(favicon);
+    expect(faviconRes.status).toBe(200);
+  }, 60_000);
+});

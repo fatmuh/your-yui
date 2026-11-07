@@ -26,6 +26,12 @@ node src/server/index.ts  # produksi: API + shell dist/ di PORT
 | `DATA_DIR` | Tidak | `data/` | Direktori file SQLite; dibuat otomatis bila belum ada. |
 | `PORT` | Tidak | `3000` | Harus bilangan bulat > 0; nilai lain (kosong, non-numerik) diabaikan dan jatuh ke default. |
 
+### Installing as an app
+
+The production build ships as an installable PWA: `npm run build` emits the web app manifest, the app icons, and a static-only service worker alongside the client shell, so a browser can install Yui as a standalone app from the served `dist/` output.
+
+Install requires a **secure origin** — HTTPS or `localhost`. Opening the server over plain LAN `http://` will not offer installation, and the session cookie is marked `Secure`, so it is not sent over insecure origins either (sign-in will not stick). Putting TLS or a tunnel in front of the server is out of scope for v1.
+
 ### Arsitektur (ringkas)
 
 Satu proses Node: server Hono (`src/server`) menyajikan API di bawah `/api` — sesi login berbasis cookie, config penyedia BYOK (kredensial dienkripsi AES-256-GCM at-rest dan hanya pernah keluar sebagai bentuk bermask), serta giliran percakapan engine ber-protokol SSE — dan menyajikan shell klien statis dari `dist/` hasil `npm run build`. Seluruh state hidup di satu file SQLite di `DATA_DIR`, dibuka dan dimigrasi otomatis saat boot. Engine percakapan berjalan in-process di server; kredensial penyedia didekripsi hanya sekejap saat dipakai.
