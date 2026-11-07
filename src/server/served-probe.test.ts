@@ -10,7 +10,7 @@ import { ulid } from "ulidx";
 import { SESSION_COOKIE } from "./auth/cookies.ts";
 import { startMockAnthropic, type MockAnthropic } from "../../tests/helpers/mock-anthropic.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../tests/helpers/mock-openai.ts";
-import { readSse, type SseEvent } from "../../tests/helpers/sse.ts";
+import { parseFrame, readSse, type SseEvent } from "../../tests/helpers/sse.ts";
 
 // Bukti R5 (probe pada build yang DISAJIKAN): entry produksi
 // src/server/index.ts di-spawn sebagai anak proses nyata (boot + migrasi +
@@ -1032,5 +1032,208 @@ describe("served build — PWA assets: manifest, service worker, icons", () => {
     const favicon = await faviconRes.text();
     responseBodies.push(favicon);
     expect(faviconRes.status).toBe(200);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// epic-pwa ticket 2 — session revocation hardening on the served build: a
+// logout issued WHILE a turn is streaming closes that SSE connection (AD-9),
+// the revoked turn still persists server-side (AD-5 — the server is the sole
+// writer, the engine prompt is not aborted), and a normal turn afterwards on
+// the same route still satisfies the full event contract. The slow provider
+// mock makes the stream outlive the reader by seconds, so a prompt `done`
+// proves the revocation watcher closed the connection, not the natural end.
+// This describe manages the module-level child itself (stop → reserve port
+// AFTER the stop → spawn), exactly like the restart tests above; declaration
+// order is the contract, so the swap cannot disturb any test above.
+// ---------------------------------------------------------------------------
+describe("served build — session revocation closes the active SSE turn", () => {
+  // State shared by the three tests below (declaration order is the contract).
+  let revokeThreadId = "";
+  let reLoginCookie = "";
+  let slowMock: MockOpenAI | null = null;
+
+  // 215 chars → 18 chunks × 250 ms ≈ 4.5 s of natural streaming. The first
+  // delta lands ≈0.3–0.6 s into the stream, so the natural end sits ≈4 s
+  // AFTER the logout point: the ≤3 s done assertion can only pass when the
+  // revocation watcher closes the connection, never because the reply ran out.
+  const slowReply =
+    "Served revocation probe reply: this deliberately slow mock drips one chunk every two hundred fifty milliseconds, so a reader that finishes long before the natural end proves the revocation watcher closed the stream.";
+  const fastReply = "Served revocation regression reply: a fast mock answers a normal turn.";
+  const revokeContent = "Served revocation marker: revoke this session mid-stream a1b7";
+  // registerUser() hardcodes this password; the test-2 re-login reuses it.
+  const revokeUsername = "probe-revoke";
+  const revokePassword = "password-tepat";
+
+  type RevokeHistoryMessage = { id: string; role: string; text: string; createdAt: string };
+
+  it("logout mid-stream closes the connection within 3s and the stream never settles", async () => {
+    // Fresh child for this describe (same pattern as the restart tests).
+    if (child === null) throw new Error("served child missing — test order broken");
+    await stopChild(child);
+    const revokePort = await reservePort();
+    child = await spawnServed(revokePort);
+    baseUrl = `http://127.0.0.1:${revokePort}`;
+
+    slowMock = await startMockOpenAI({ chunkDelayMs: 250, replyText: slowReply });
+    openMocks.push(slowMock);
+    const mock: MockOpenAI = slowMock;
+    const cookie = await registerUser(revokeUsername);
+    const put = await putConfig(cookie, "openai-compatible", {
+      apiKey: OPENAI_API_KEY,
+      baseUrl: mock.baseUrl,
+      modelId: "mock-model",
+    });
+    expect(put.baseUrl).toBe(mock.baseUrl);
+
+    // POST the turn but do NOT await the whole body: frames are consumed
+    // incrementally so the session can be revoked while the stream is live.
+    const res = await fetch(`${baseUrl}/api/engine/turn`, {
+      method: "POST",
+      headers: { ...JSON_HEADERS, cookie },
+      body: JSON.stringify({ content: revokeContent, clientToken: "tok-served-revoke" }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+    // Incremental mirror of readSse (same shared parseFrame, no duplication),
+    // split into two phases around the logout so both sides stay measurable.
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    const events: SseEvent[] = [];
+    let buffer = "";
+    let raw = "";
+    const absorb = (text: string): void => {
+      raw += text;
+      buffer += text;
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const parsed = parseFrame(frame);
+        if (parsed !== null) events.push(parsed);
+        boundary = buffer.indexOf("\n\n");
+      }
+    };
+
+    // Phase 1 — read until the first delta proves the reply is flowing.
+    let deltasAtLogout = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) throw new Error("stream ended before any message.delta arrived");
+      absorb(decoder.decode(value, { stream: true }));
+      deltasAtLogout = events.filter((frame) => frame.event === "message.delta").length;
+      if (deltasAtLogout > 0) break;
+    }
+
+    // Revoke mid-stream. The route is idempotent and answers 204 No Content
+    // (no body to leak, no session existence signal).
+    const logout = await requestJson("/api/auth/logout", {
+      method: "POST",
+      headers: { cookie },
+    });
+    expect(logout.status).toBe(204);
+    const logoutDoneAt = Date.now();
+
+    // Phase 2 — drain to done. The server watcher polls every 500 ms, so the
+    // reader should finish ≈0.5 s from now, ≈4 s before the natural end.
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      absorb(decoder.decode(value, { stream: true }));
+    }
+    const doneAt = Date.now();
+    responseBodies.push(raw); // R2 audit: the partial stream body counts too.
+
+    // The stream was real: exactly one provider call, with the PUT key on the wire.
+    expect(mock.requests).toHaveLength(1);
+    expect(mock.requests[0].authorization).toBe(`Bearer ${OPENAI_API_KEY}`);
+
+    // Non-vacuous: at least one delta was already delivered before the logout.
+    expect(deltasAtLogout).toBeGreaterThanOrEqual(1);
+    // The watcher closed the connection — ≤3 s from the logout, which only
+    // revocation can explain (natural end is ≈4 s away).
+    expect(doneAt - logoutDoneAt).toBeLessThanOrEqual(3_000);
+    // A revoked stream never settles: the AD-4 delta→final→settled contract is
+    // promised only for streams that were allowed to finish.
+    expect(events.filter((frame) => frame.event === "turn.settled")).toHaveLength(0);
+
+    // The user-write event leads the stream; its threadId feeds the next test.
+    expect(events[0]!.event).toBe("thread.updated");
+    const first = events.find((frame) => frame.event === "thread.updated");
+    expect(first).toBeDefined();
+    revokeThreadId = String(first!.data.threadId);
+  }, 60_000);
+
+  it("re-login after revocation: the revoked turn still persisted BOTH messages (AD-5)", async () => {
+    if (revokeThreadId === "") throw new Error("revocation thread missing — test order broken");
+
+    // Same credentials as registerUser above.
+    const login = await requestJson("/api/auth/login", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ username: revokeUsername, password: revokePassword }),
+    });
+    expect(login.status).toBe(200);
+    const cookie = login.headers
+      .getSetCookie()
+      .find((entry) => entry.startsWith(`${SESSION_COOKIE}=`));
+    expect(cookie).toBeDefined();
+    reLoginCookie = cookie!.split(";")[0]!;
+
+    // Revocation closes the CONNECTION, not the turn: the engine kept
+    // streaming from the slow mock in the background and persists the
+    // assistant message at its natural end, several seconds AFTER test 1's
+    // reader finished. Poll history until the turn lands — bounded, so a
+    // revoked turn that never persisted fails here instead of passing vacuously.
+    const deadline = Date.now() + 10_000;
+    let messages: RevokeHistoryMessage[] = [];
+    for (;;) {
+      const history = await requestJson(`/api/threads/${revokeThreadId}/messages`, {
+        headers: { cookie: reLoginCookie },
+      });
+      expect(history.status).toBe(200);
+      messages = history.body as RevokeHistoryMessage[];
+      if (messages.length >= 2 || Date.now() > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    // Concrete final assertion (not just the poll's exit condition): exactly
+    // the user marker and the full assistant reply, in order.
+    expect(messages).toHaveLength(2);
+    expect(messages.map((message) => [message.role, message.text])).toEqual([
+      ["user", revokeContent],
+      ["assistant", slowReply],
+    ]);
+  }, 60_000);
+
+  it("normal turn on the same path: full thread.updated → delta → final → settled contract", async () => {
+    if (reLoginCookie === "") throw new Error("re-login cookie missing — test order broken");
+
+    // Second, FAST mock: chunkDelayMs is bound to the mock instance, so the
+    // regression needs its own instance; the PUT overwrites the stored
+    // baseUrl (one config per kind — latest call wins).
+    const fastMock = await startMockOpenAI({ replyText: fastReply });
+    openMocks.push(fastMock);
+    const put = await putConfig(reLoginCookie, "openai-compatible", {
+      apiKey: OPENAI_API_KEY,
+      baseUrl: fastMock.baseUrl,
+      modelId: "mock-model",
+    });
+    expect(put.baseUrl).toBe(fastMock.baseUrl);
+
+    const turn = await postTurn(reLoginCookie, {
+      content: "Served revocation regression marker d93k",
+      clientToken: "tok-served-revoke-regression",
+    });
+    assertFullContract(turn.events, {
+      threadId: threadIdFromEvents(turn.events),
+      clientToken: "tok-served-revoke-regression",
+      reply: fastReply,
+    });
+
+    // The overwritten config took effect: exactly one call hit the FAST mock.
+    expect(fastMock.requests).toHaveLength(1);
+    expect(fastMock.requests[0].authorization).toBe(`Bearer ${OPENAI_API_KEY}`);
   }, 60_000);
 });

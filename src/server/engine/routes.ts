@@ -30,6 +30,11 @@ import { PROVIDER_KINDS, type ProviderKind, type YuiEvent } from "../../shared/e
 
 const MAX_CONTENT_CHARS = 8_000;
 
+// Revocation poll cadence for an in-flight turn stream (AD-9): a logout is
+// detected within this window; the lookup is an indexed token-hash select,
+// cheap to repeat while a stream is open.
+const REVOKE_POLL_MS = 500;
+
 // Validasi kind memakai PROVIDER_KINDS dari kontrak shared — satu sumber
 // kebenaran runtime (pola `Record<ProviderKind, true>` menjaga kelengkapan
 // union di kompilator; lihat src/shared/engine.ts).
@@ -230,6 +235,44 @@ export function engineRoutes(db: YuiDatabase): Hono {
           });
       };
 
+      // AD-9 revocation watch: the session gate above only runs PRE-stream, so
+      // a logout during a live turn would otherwise leave this SSE connection
+      // open until the engine reply finishes. Poll the session row while the
+      // turn streams; once the token no longer resolves to a user, stop
+      // forwarding NEW events at once, then close the connection after the
+      // already-queued writes drain (detection window ≤ REVOKE_POLL_MS). The
+      // engine prompt itself is NOT aborted: the server stays the sole writer
+      // (AD-5) and still persists this turn's assistant message on
+      // message.final — the full event contract is simply not promised for a
+      // revoked stream.
+      const stopWatchAndClose = () => {
+        writable = false;
+        clearInterval(revocationWatch);
+        queue = queue.then(() => stream.close()).catch(() => {});
+      };
+      const revocationWatch = setInterval(() => {
+        if (token === undefined) return;
+        try {
+          if (sessionUser(db, token) !== null) return;
+        } catch {
+          // The session can no longer be attested (the lookup threw): close
+          // conservatively instead of letting the error escape the timer — an
+          // uncaught throw inside setInterval would take down the process,
+          // a far bigger blast radius than the 500 this route returns when
+          // the same lookup throws on the pre-stream gate path.
+          stopWatchAndClose();
+          return;
+        }
+        stopWatchAndClose();
+      }, REVOKE_POLL_MS);
+      // Client disconnected: stop polling for its revocation and drop writes.
+      // Without this, a provider that accepts the connection but never
+      // settles would keep the interval alive for the process lifetime.
+      stream.onAbort(() => {
+        clearInterval(revocationWatch);
+        writable = false;
+      });
+
       // (2) kabar tulis user — event pertama stream; `title` hanya dibawa
       // saat thread baru (rename = fitur client pasca-v1, bukan story ini).
       sink(
@@ -269,6 +312,10 @@ export function engineRoutes(db: YuiDatabase): Hono {
             : "The turn failed unexpectedly.";
         sink({ type: "error", threadId, code: "turn_failed", message });
         sink({ type: "turn.settled", threadId });
+      } finally {
+        // Every exit path (natural end, adapter error, revocation) clears the
+        // timer — a normal turn never leaks an interval across requests.
+        clearInterval(revocationWatch);
       }
       await queue;
     });
