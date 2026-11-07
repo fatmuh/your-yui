@@ -55,11 +55,12 @@ describe("migrasi schema dasar", () => {
 
     migrateDatabase(db);
 
-    // Tabel fondasi (users, auth_sessions) + tabel epik penyedia
-    // (provider_configs, story tracer epic-penyedia) + tabel epik percakapan
-    // (threads, messages, story REST baca riwayat) + internal drizzle.
+    // Foundation tables (users, auth_sessions) + provider epic tables
+    // (provider_configs) + conversation epic tables (threads, messages) +
+    // voice epic table (audio_blobs, upload/playback API) + drizzle internal.
     expect(tableNames(file)).toEqual([
       "__drizzle_migrations",
+      "audio_blobs",
       "auth_sessions",
       "messages",
       "provider_configs",
@@ -87,13 +88,13 @@ describe("migrasi schema dasar", () => {
 
     const raw = new Database(file);
     try {
-      // Empat migrasi ter-commit: fondasi (0000) + penyedia (0001) + kolom
-      // masked_hint provider_configs (0002, story API config penyedia) +
-      // threads/messages (0003, story REST baca riwayat epic-percakapan).
+      // Five committed migrations: foundation (0000) + provider (0001) +
+      // provider_configs.masked_hint column (0002) + threads/messages (0003)
+      // + audio_blobs and messages.audio_id (0004, voice upload/playback).
       const applied = raw
         .prepare("SELECT count(*) AS n FROM __drizzle_migrations")
         .get() as { n: number };
-      expect(applied.n).toBe(4);
+      expect(applied.n).toBe(5);
     } finally {
       raw.close();
     }

@@ -72,11 +72,11 @@ export const threads = sqliteTable(
   (table) => [index("threads_user_id_updated_at_index").on(table.userId, table.updatedAt)],
 );
 
-// `role` menyimpan nilai `MessageRole` kontrak shared — selaras tipe Message
-// template client ('user' | 'assistant'); tanpa kolom spekulatif di luar R2
-// (token/kind/audio menyusul story 3+ bila dibutuhkan). Nilai dijaga CHECK
-// constraint di DB — kolom TEXT mentah tanpa check akan menerima apa pun dan
-// lolos ke wire lewat cast di route.
+// `role` stores the shared-contract `MessageRole` values — aligned with the
+// client template's Message type ('user' | 'assistant'); no speculative
+// columns beyond the epic (token/kind to follow if needed; `audio_id` comes
+// from epic-voice). Values are guarded by a DB CHECK constraint — a raw TEXT
+// column without one would accept anything and reach the wire via a route cast.
 
 export const messages = sqliteTable(
   "messages",
@@ -87,6 +87,11 @@ export const messages = sqliteTable(
       .references(() => threads.id, { onDelete: "cascade" }),
     role: text("role").notNull(),
     text: text("text").notNull(),
+    // epic-voice (AD-6): optional attached voice note. Nullable, no `onDelete`
+    // action — GC (story 2) deletes blobs without touching messages, so the FK
+    // is a dangling-pointer-by-design backstop, not a delete trigger. The turn
+    // route validates ownership at attach time via resolveAudioBlob.
+    audioId: text("audio_id").references(() => audioBlobs.id),
     createdAt: integer("created_at").notNull(),
   },
   (table) => [
@@ -95,8 +100,27 @@ export const messages = sqliteTable(
   ],
 );
 
+// epic-voice (AD-6): `audio_blobs` — one row per uploaded voice note; the bytes
+// live ONLY in SQLite (no filesystem layout). `mime` is stored verbatim from
+// the upload (e.g. "audio/webm;codecs=opus") because only the recording
+// browser knows the codec; playback writes it back as-is. `duration_ms` is the
+// client-measured recording length. No index beyond the PK: access is by-id
+// (PK) and the story-2 GC sweep is a small full scan over a table bounded by
+// the 5 MB per-blob upload cap.
+export const audioBlobs = sqliteTable("audio_blobs", {
+  id: text("id").primaryKey(),
+  ownerUserId: text("owner_user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  mime: text("mime").notNull(),
+  durationMs: integer("duration_ms").notNull(),
+  blob: blob("blob", { mode: "buffer" }).notNull(),
+  createdAt: integer("created_at").notNull(),
+});
+
 export type User = InferSelectModel<typeof users>;
 export type AuthSession = InferSelectModel<typeof authSessions>;
 export type ProviderConfig = InferSelectModel<typeof providerConfigs>;
 export type Thread = InferSelectModel<typeof threads>;
 export type Message = InferSelectModel<typeof messages>;
+export type AudioBlob = InferSelectModel<typeof audioBlobs>;
