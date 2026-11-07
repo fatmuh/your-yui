@@ -9,6 +9,20 @@ import { providerConfigRoutes } from "./providers/routes.ts";
 export function createApp(staticRoot = "dist", db?: YuiDatabase) {
   const app = new Hono();
 
+  // Penutup kelas jalur error tak-tertangani (deferred review 2.3): throw
+  // apa pun (mis. CryptoError saat APP_ENCRYPTION_KEY absen di PUT config)
+  // dipetakan ke 500 envelope konvensi spine dengan kode stabil
+  // `internal_error`. Respons sengaja generik — detail error asli (pesan +
+  // stack) hanya ke log server-side; pesan CryptoError tak pernah memuat
+  // kredensial, hanya nama env var.
+  app.onError((err, c) => {
+    console.error("Unhandled error:", err);
+    return c.json(
+      { error: { code: "internal_error", message: "Internal server error." } },
+      500,
+    );
+  });
+
   app.get("/healthz", (c) => {
     const body: HealthDto = { app: APP_ID };
     return c.json(body);

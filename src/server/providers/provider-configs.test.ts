@@ -2,13 +2,15 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Hono } from "hono";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
 import { providerConfigs } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { maskSecret } from "./crypto.ts";
+import { registerUser } from "../../../tests/helpers/api.ts";
+import { readSse } from "../../../tests/helpers/sse.ts";
 
 // Bukti story API config penyedia (R1 API + R2, AD-3/AD-9): PUT/GET/DELETE
 // /api/provider-configs/:kind di balik gerbang sesi; view bermask dari
@@ -38,21 +40,7 @@ beforeAll(() => {
   process.env.APP_ENCRYPTION_KEY = KEY_B64;
 });
 
-/** Register + ambil token cookie mentah dari Set-Cookie beserta userId. */
-async function registerUser(app: Hono, username: string): Promise<{ token: string; userId: string }> {
-  const res = await app.request("/api/auth/register", {
-    method: "POST",
-    body: JSON.stringify({ username, password: "password-tepat" }),
-    headers: { "content-type": "application/json" },
-  });
-  expect(res.status).toBe(201);
-  const cookie = res.headers
-    .getSetCookie()
-    .find((entry) => entry.startsWith(`${SESSION_COOKIE}=`));
-  expect(cookie).toBeDefined();
-  const body = (await res.json()) as { id: string };
-  return { token: cookie!.split(";")[0]!.slice(SESSION_COOKIE.length + 1), userId: body.id };
-}
+/** Register kini dari tests/helpers/api.ts (ekstraksi byte-identik). */
 
 async function call(
   app: Hono,
@@ -79,41 +67,6 @@ const OPENAI_BODY = {
   apiKey: "sk-live-openai-1111aaaa",
 };
 const ANTHROPIC_KEY = "sk-live-anthropic-2222bbbb";
-
-type SseEvent = { event: string; data: Record<string, unknown> };
-
-/** Baca seluruh stream SSE sampai tutup; kembalikan frame terurut. */
-async function readSse(res: Response): Promise<SseEvent[]> {
-  expect(res.body).not.toBeNull();
-  const reader = res.body!.getReader();
-  const decoder = new TextDecoder();
-  const events: SseEvent[] = [];
-  let buffer = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      let event = "message";
-      const dataLines: string[] = [];
-      for (const line of frame.split("\n")) {
-        if (line.startsWith("event:")) {
-          event = line.slice(6).trim();
-        } else if (line.startsWith("data:")) {
-          dataLines.push(line.slice(5).replace(/^ /, ""));
-        }
-      }
-      if (dataLines.length > 0) {
-        events.push({ event, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> });
-      }
-      boundary = buffer.indexOf("\n\n");
-    }
-  }
-  return events;
-}
 
 afterEach(() => {
   while (openDbs.length > 0) {
@@ -259,7 +212,7 @@ describe("DELETE /api/provider-configs/:kind", () => {
       },
     });
     expect(turn.status).toBe(200);
-    const events = await readSse(turn);
+    const { events } = await readSse(turn);
     expect(events.map((frame) => frame.event)).toEqual(["error", "turn.settled"]);
     expect(events[0].data.code).toBe("no_provider_config");
 
@@ -391,6 +344,54 @@ describe("tanpa sesi", () => {
       await expect(res.json(), method).resolves.toEqual({
         error: { code: "unauthorized", message: expect.any(String) },
       });
+    }
+  });
+});
+
+describe("error tak-tertangani (app.onError)", () => {
+  it("PUT dengan APP_ENCRYPTION_KEY absen: 500 envelope internal_error, error asli hanya ke log server-side (deferred 2.3)", async () => {
+    const { app } = makeApp();
+    const user = await registerUser(app, "kek-absen-put");
+
+    // Tangkap console.error (log server-side) tanpa membuang output aslinya
+    // dari proses test — hanya untuk asersi isi log.
+    const logged: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      logged.push(args.map((arg) => String(arg)).join(" "));
+    });
+
+    const prev = process.env.APP_ENCRYPTION_KEY;
+    delete process.env.APP_ENCRYPTION_KEY;
+    try {
+      const res = await call(app, "PUT", "openai-compatible", user.token, OPENAI_BODY);
+      expect(res.status).toBe(500);
+      expect(res.headers.get("content-type")).toContain("application/json");
+
+      // Envelope konvensi spine — bukan plain-text 500 default framework.
+      const text = await res.text();
+      expect(JSON.parse(text)).toEqual({
+        error: { code: "internal_error", message: expect.any(String) },
+      });
+
+      // Respons generik-stabil: tanpa nama env var, tanpa kredensial,
+      // tanpa pesan/stack internal.
+      expect(text).not.toContain("APP_ENCRYPTION_KEY");
+      expect(text).not.toContain(OPENAI_BODY.apiKey);
+
+      // Error ASLI ter-log server-side: CryptoError dengan pesan yang hanya
+      // menyebut nama env var (satu-satunya rinciannya) — tak pernah
+      // memuat kredensial.
+      const serverLog = logged.join("\n");
+      expect(serverLog).toContain("CryptoError");
+      expect(serverLog).toContain("APP_ENCRYPTION_KEY");
+      expect(serverLog).not.toContain(OPENAI_BODY.apiKey);
+    } finally {
+      errorSpy.mockRestore();
+      if (prev === undefined) {
+        delete process.env.APP_ENCRYPTION_KEY;
+      } else {
+        process.env.APP_ENCRYPTION_KEY = prev;
+      }
     }
   });
 });

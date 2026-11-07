@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { SESSION_COOKIE } from "./auth/cookies.ts";
 import { startMockAnthropic, type MockAnthropic } from "../../tests/helpers/mock-anthropic.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../tests/helpers/mock-openai.ts";
+import { readSse, type SseEvent } from "../../tests/helpers/sse.ts";
 
 // Bukti R5 (probe pada build yang DISAJIKAN): entry produksi
 // src/server/index.ts di-spawn sebagai anak proses nyata (boot + migrasi +
@@ -39,8 +40,6 @@ let childOutput = "";
 const openMocks: Array<MockOpenAI | MockAnthropic> = [];
 /** Setiap body respons yang pernah diterima test — untuk audit R2. */
 const responseBodies: string[] = [];
-
-type SseEvent = { event: string; data: Record<string, unknown> };
 
 /** Cadangkan port lewat listen(0) lalu tutup — PORT=0 ditolak index.ts (jatuh default 3000). */
 function reservePort(): Promise<number> {
@@ -201,45 +200,12 @@ async function getConfig(cookie: string, kind: string): Promise<ConfigView> {
   return res.body as ConfigView;
 }
 
-/** Baca seluruh stream SSE dari soket nyata sampai tutup; kembalikan frame terurut. */
-async function readSse(res: Response): Promise<{ events: SseEvent[]; raw: string }> {
-  expect(res.body).not.toBeNull();
-  const reader = res.body!.getReader();
-  const decoder = new TextDecoder();
-  const events: SseEvent[] = [];
-  let buffer = "";
-  let raw = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const text = decoder.decode(value, { stream: true });
-    raw += text;
-    buffer += text;
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const parsed = parseFrame(frame);
-      if (parsed !== null) events.push(parsed);
-      boundary = buffer.indexOf("\n\n");
-    }
-  }
-  responseBodies.push(raw);
-  return { events, raw };
-}
-
-function parseFrame(frame: string): SseEvent | null {
-  let event = "message";
-  const dataLines: string[] = [];
-  for (const line of frame.split("\n")) {
-    if (line.startsWith("event:")) {
-      event = line.slice(6).trim();
-    } else if (line.startsWith("data:")) {
-      dataLines.push(line.slice(5).replace(/^ /, ""));
-    }
-  }
-  if (dataLines.length === 0) return null;
-  return { event, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> };
+/** readSse bersama (tests/helpers/sse.ts) + rekam raw body untuk audit R2 —
+ * helper murni tak tahu perekaman, probe membungkus untuk pencatatan. */
+async function readSseRecorded(res: Response): Promise<{ events: SseEvent[]; raw: string }> {
+  const result = await readSse(res);
+  responseBodies.push(result.raw);
+  return result;
 }
 
 function names(events: SseEvent[]): string[] {
@@ -257,7 +223,7 @@ async function postTurn(
   });
   expect(res.status).toBe(200);
   expect(res.headers.get("content-type")).toContain("text/event-stream");
-  return readSse(res);
+  return readSseRecorded(res);
 }
 
 /** Kontrak giliran penuh (R5): ≥2 delta kumulatif prefix-monotonic → 1 final
