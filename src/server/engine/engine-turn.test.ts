@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Hono } from "hono";
+import { ulid } from "ulidx";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
-import { threads } from "../db/schema.ts";
+import { messages, threads } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { upsertProviderConfig } from "../providers/store.ts";
 import { startMockOpenAI, type MockOpenAI } from "../../../tests/helpers/mock-openai.ts";
@@ -56,6 +57,38 @@ function seedConfig(db: YuiDatabase, userId: string, mock: MockOpenAI, apiKey: s
 
 function names(events: SseEvent[]): string[] {
   return events.map((frame) => frame.event);
+}
+
+/** Upload one voice note through the real audio route; returns the blob id. */
+async function uploadAudio(
+  app: Hono,
+  token: string,
+  durationMs: number,
+  mime = "audio/webm;codecs=opus",
+): Promise<string> {
+  const form = new FormData();
+  form.append("file", new File([new Uint8Array(64)], "note.webm", { type: mime }));
+  form.append("durationMs", String(durationMs));
+  const res = await app.request("/api/audio", {
+    method: "POST",
+    body: form,
+    headers: { cookie: `${SESSION_COOKIE}=${token}` },
+  });
+  expect(res.status).toBe(201);
+  return ((await res.json()) as { id: string }).id;
+}
+
+/** GET /api/threads/:id/messages as the session user. */
+async function fetchHistory(
+  app: Hono,
+  token: string,
+  threadId: string,
+): Promise<Array<Record<string, unknown>>> {
+  const res = await app.request(`/api/threads/${threadId}/messages`, {
+    headers: { cookie: `${SESSION_COOKIE}=${token}` },
+  });
+  expect(res.status).toBe(200);
+  return (await res.json()) as Array<Record<string, unknown>>;
 }
 
 /** Fixture thread milik sesi (story 3: threadId string kini wajib thread
@@ -359,4 +392,147 @@ describe("POST /api/engine/turn — matriks story", () => {
     const id2 = second.events.find((frame) => frame.event === "message.final")?.data.messageId;
     expect(id1).not.toBe(id2);
   }, 30_000);
+});
+
+describe("POST /api/engine/turn — voice notes (epic-voice story 2)", () => {
+  it("voice-only turn on a new thread: placeholder stored with audio_id, full SSE contract, provider transcript carries the voice line, history exposes audio", async () => {
+    const { app, db } = makeApp();
+    const reply = "A spoken answer from the local mock.";
+    const mock = await startMockOpenAI({ replyText: reply });
+    openMocks.push(mock);
+    const user = await registerUser(app, "voice-baru");
+    seedConfig(db, user.userId, mock, "sk-live-voice-baru-1111aa");
+    const mime = "audio/webm;codecs=opus";
+    const audioId = await uploadAudio(app, user.token, 42_000, mime);
+
+    const res = await postTurn(app, user.token, { audioId });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+    const { events } = await readSse(res);
+    const sequence = names(events);
+
+    // Full AD-4 contract, identical shape to a text turn: thread.updated first
+    // (new thread → title derived from the placeholder), cumulative deltas,
+    // exactly one final, settled last, no error.
+    expect(sequence[0]).toBe("thread.updated");
+    expect(events[0].data.title).toBe("[Voice note: 0:42]");
+    const threadId = events[0].data.threadId;
+    expect(typeof threadId).toBe("string");
+    expect(sequence[sequence.length - 1]).toBe("turn.settled");
+    expect(sequence).not.toContain("error");
+
+    const deltas = events.filter((frame) => frame.event === "message.delta");
+    expect(deltas.length).toBeGreaterThanOrEqual(2);
+    const finals = events.filter((frame) => frame.event === "message.final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.data.text).toBe(reply);
+
+    // The engine reads the stored placeholder as plain message text via the
+    // transcript — no engine/adapter involvement (no transcription, AD-1).
+    expect(mock.requests).toHaveLength(1);
+    expect(mock.requests[0].body).toContain("user: [Voice note: 0:42]");
+
+    // Persisted user message: placeholder text + the attached blob id; the
+    // assistant reply carries no audio.
+    const stored = db.select().from(messages).all();
+    expect(stored.map((row) => row.role)).toEqual(["user", "assistant"]);
+    expect(stored[0]!.text).toBe("[Voice note: 0:42]");
+    expect(stored[0]!.audioId).toBe(audioId);
+    expect(stored[1]!.audioId).toBeNull();
+
+    // History REST shows audio {id, mime, durationMs} on the voice message only.
+    const history = await fetchHistory(app, user.token, threadId as string);
+    expect(history).toHaveLength(2);
+    expect(history[0]).toMatchObject({
+      id: stored[0]!.id,
+      role: "user",
+      text: "[Voice note: 0:42]",
+      audio: { id: audioId, mime, durationMs: 42_000 },
+    });
+    expect(history[1]).not.toHaveProperty("audio");
+  }, 30_000);
+
+  it("voice turn on an existing thread: same contract on that thread, zero-padded seconds placeholder", async () => {
+    const { app, db } = makeApp();
+    const reply = "Answered on the existing thread.";
+    const mock = await startMockOpenAI({ replyText: reply });
+    openMocks.push(mock);
+    const user = await registerUser(app, "voice-thread-lama");
+    seedConfig(db, user.userId, mock, "sk-live-voice-lama-2222bb");
+    seedThread(db, user.userId, "thread-voice-lama");
+    const audioId = await uploadAudio(app, user.token, 125_000);
+
+    const res = await postTurn(app, user.token, { threadId: "thread-voice-lama", audioId });
+    expect(res.status).toBe(200);
+    const { events } = await readSse(res);
+    const sequence = names(events);
+
+    // Existing thread: thread.updated first WITHOUT a title, then the same
+    // delta → final → settled shape as a text turn.
+    expect(sequence[0]).toBe("thread.updated");
+    expect(events[0].data).not.toHaveProperty("title");
+    expect(events[0].data.threadId).toBe("thread-voice-lama");
+    expect(sequence[sequence.length - 1]).toBe("turn.settled");
+    expect(sequence).not.toContain("error");
+    const finalEvent = events.find((frame) => frame.event === "message.final");
+    expect(finalEvent?.data.text).toBe(reply);
+
+    // 125000 ms → "[Voice note: 2:05]" (seconds zero-padded by the helper).
+    expect(mock.requests).toHaveLength(1);
+    expect(mock.requests[0].body).toContain("user: [Voice note: 2:05]");
+
+    const history = await fetchHistory(app, user.token, "thread-voice-lama");
+    expect(history.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(history[0]).toMatchObject({
+      text: "[Voice note: 2:05]",
+      audio: { id: audioId, mime: "audio/webm;codecs=opus", durationMs: 125_000 },
+    });
+  }, 30_000);
+
+  it("foreign audioId vs unknown audioId: identical 404 envelopes, and nothing is written", async () => {
+    const { app, db } = makeApp();
+    const owner = await registerUser(app, "voice-pemilik");
+    const stranger = await registerUser(app, "voice-penginta");
+    const audioId = await uploadAudio(app, owner.token, 3_000);
+
+    const foreign = await postTurn(app, stranger.token, { audioId });
+    expect(foreign.status).toBe(404);
+    const unknown = await postTurn(app, stranger.token, { audioId: ulid() });
+    expect(unknown.status).toBe(404);
+
+    // Byte-identical bodies: "someone else's blob" is indistinguishable from
+    // "never existed" (the same convention as the thread 404).
+    const foreignBody = await foreign.json();
+    const unknownBody = await unknown.json();
+    expect(foreignBody).toEqual({ error: { code: "not_found", message: expect.any(String) } });
+    expect(unknownBody).toEqual(foreignBody);
+
+    // The attach is rejected BEFORE any write: no thread, no message for the
+    // stranger (and the owner's blob is untouched).
+    expect(db.select().from(threads).all()).toEqual([]);
+    expect(db.select().from(messages).all()).toEqual([]);
+  });
+
+  it("content and audioId together → 400 invalid_request; both absent → 400 (original rule)", async () => {
+    const { app, db } = makeApp();
+    const user = await registerUser(app, "voice-xor");
+    const audioId = await uploadAudio(app, user.token, 1_500);
+
+    const both = await postTurn(app, user.token, { content: "Halo", audioId });
+    expect(both.status).toBe(400);
+    await expect(both.json()).resolves.toEqual({
+      error: { code: "invalid_request", message: expect.stringContaining("either") },
+    });
+
+    const neither = await postTurn(app, user.token, {});
+    expect(neither.status).toBe(400);
+    await expect(neither.json()).resolves.toEqual({
+      error: { code: "invalid_request", message: expect.any(String) },
+    });
+
+    // Both rejections are pre-write.
+    expect(db.select().from(threads).all()).toEqual([]);
+    expect(db.select().from(messages).all()).toEqual([]);
+  });
 });

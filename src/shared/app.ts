@@ -75,6 +75,14 @@ export type MessageDto = {
   id: string;
   role: MessageRole;
   text: string;
+  /**
+   * Attached voice note (epic-voice): present only on user messages stored
+   * from an audio turn. The client renders `durationMs` from here — it never
+   * re-derives the placeholder text. Omitted when the message has no audio or
+   * the blob is no longer resolvable; `text` then still carries the stored
+   * placeholder.
+   */
+  audio?: { id: string; mime: string; durationMs: number };
   /** ISO-8601 UTC (DB stores epoch-ms; converted at the edge). */
   createdAt: string;
 };

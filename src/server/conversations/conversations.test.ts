@@ -7,7 +7,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import type { Hono } from "hono";
 import { createApp } from "../app.ts";
 import { createDatabase, migrateDatabase, type YuiDatabase } from "../db/index.ts";
-import { messages, threads, users } from "../db/schema.ts";
+import { audioBlobs, messages, threads, users } from "../db/schema.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import { registerUser } from "../../../tests/helpers/api.ts";
 
@@ -231,6 +231,62 @@ describe("GET /api/threads/:id/messages", () => {
     const body = (await res.json()) as Array<Record<string, unknown>>;
     expect(body.map((message) => message.id)).toEqual([question, reply]);
     expect(body.map((message) => message.role)).toEqual(["user", "assistant"]);
+  });
+
+  it("voice message maps audio {id, mime, durationMs} onto the DTO; an unresolvable blob omits audio but keeps the placeholder text", async () => {
+    const { app, db } = makeApp();
+    const user = await registerUser(app, "dto-audio");
+    const base = Date.UTC(2026, 10, 7, 9, 0, 0);
+    const threadId = seedThread(db, user.userId, { createdAt: base, updatedAt: base });
+
+    const audioId = ulid();
+    db.insert(audioBlobs)
+      .values({
+        id: audioId,
+        ownerUserId: user.userId,
+        mime: "audio/webm;codecs=opus",
+        durationMs: 42_000,
+        blob: Buffer.alloc(64),
+        createdAt: base,
+      })
+      .run();
+    db.insert(messages)
+      .values({
+        id: "01MSG-AUDIO-USER",
+        threadId,
+        role: "user",
+        text: "[Voice note: 0:42]",
+        audioId,
+        createdAt: base,
+      })
+      .run();
+    seedMessage(db, threadId, "assistant", "Siap.", base + 1_000);
+
+    const withBlob = await getMessages(app, user.token, threadId);
+    expect(withBlob.status).toBe(200);
+    const mapped = (await withBlob.json()) as Array<Record<string, unknown>>;
+    expect(mapped).toHaveLength(2);
+    expect(mapped[0]).toMatchObject({
+      id: "01MSG-AUDIO-USER",
+      role: "user",
+      text: "[Voice note: 0:42]",
+      audio: { id: audioId, mime: "audio/webm;codecs=opus", durationMs: 42_000 },
+    });
+    expect(mapped[1]).not.toHaveProperty("audio");
+
+    // Blob gone from under the message: `audio` is omitted and the stored
+    // placeholder text stays — history must not break on a dangling reference.
+    // FK checks are disabled for this fixture delete only, because a dangling
+    // pointer is exactly the case under test.
+    db.$client.pragma("foreign_keys = OFF");
+    db.delete(audioBlobs).where(eq(audioBlobs.id, audioId)).run();
+    db.$client.pragma("foreign_keys = ON");
+
+    const after = await getMessages(app, user.token, threadId);
+    expect(after.status).toBe(200);
+    const dangling = (await after.json()) as Array<Record<string, unknown>>;
+    expect(dangling[0]).not.toHaveProperty("audio");
+    expect(dangling[0]).toMatchObject({ text: "[Voice note: 0:42]" });
   });
 
   it("thread milik B diakses A → 404; thread tak ada → 404 IDENTIK; thread sah kosong → []", async () => {

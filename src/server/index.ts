@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { APP_NAME } from "../shared/app.ts";
 import { createApp } from "./app.ts";
+import { sweepOrphanAudioBlobs } from "./conversations/audio-gc.ts";
 import { createDatabase, migrateDatabase, resolveDatabasePath } from "./db/index.ts";
 
 const DEFAULT_PORT = 3000;
@@ -19,6 +20,13 @@ if (process.env.PORT !== undefined && parsedPort !== port) {
 // dimigrasi sekali saat boot sebelum server menerima koneksi.
 const db = createDatabase(resolveDatabasePath());
 migrateDatabase(db);
+
+// epic-voice: one-shot sweep of orphaned audio blobs (uploaded but never
+// attached to a message, older than the 24h grace window) before serving.
+const sweptOrphans = sweepOrphanAudioBlobs(db, Date.now());
+if (sweptOrphans > 0) {
+  console.log(`Swept ${sweptOrphans} orphaned audio blob${sweptOrphans === 1 ? "" : "s"}.`);
+}
 
 const app = createApp("dist", db);
 

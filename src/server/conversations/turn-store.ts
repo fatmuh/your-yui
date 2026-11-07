@@ -117,6 +117,7 @@ export function createThreadWithMessage(
   userId: string,
   content: string,
   at: number,
+  audioId?: string,
 ): CreatedThread {
   const threadId = newUlid();
   const title = deriveTitle(content);
@@ -125,7 +126,17 @@ export function createThreadWithMessage(
   // one value straight from the same monotonic helper.
   const writeAt = monotonicThreadTime(db, userId, threadId, at);
   db.insert(threads).values({ id: threadId, userId, title, createdAt: writeAt, updatedAt: writeAt }).run();
-  db.insert(messages).values({ id: newUlid(), threadId, role: "user", text: content, createdAt: writeAt }).run();
+  db.insert(messages)
+    .values({
+      id: newUlid(),
+      threadId,
+      role: "user",
+      text: content,
+      createdAt: writeAt,
+      // epic-voice: voice turns store the placeholder text AND the blob ref.
+      ...(audioId === undefined ? {} : { audioId }),
+    })
+    .run();
   return { threadId, title, updatedAt: writeAt };
 }
 
@@ -146,10 +157,21 @@ export function appendUserMessage(
   threadId: string,
   text: string,
   at: number,
+  audioId?: string,
 ): AppendedMessage {
   const messageId = newUlid();
   const writeAt = monotonicThreadTime(db, userId, threadId, at);
-  db.insert(messages).values({ id: messageId, threadId, role: "user", text, createdAt: writeAt }).run();
+  db.insert(messages)
+    .values({
+      id: messageId,
+      threadId,
+      role: "user",
+      text,
+      createdAt: writeAt,
+      // epic-voice: voice turns store the placeholder text AND the blob ref.
+      ...(audioId === undefined ? {} : { audioId }),
+    })
+    .run();
   const updatedAt = touchThread(db, userId, threadId, writeAt);
   return { messageId, updatedAt };
 }

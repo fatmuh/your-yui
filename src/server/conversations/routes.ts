@@ -8,6 +8,7 @@ import { sessionUser } from "../auth/service.ts";
 import { SESSION_COOKIE } from "../auth/cookies.ts";
 import type { MessageDto, MessageRole, ThreadDto } from "../../shared/app.ts";
 import { listMessages, listThreads } from "./store.ts";
+import { getAudioById } from "../audio/store.ts";
 import type { Message, Thread } from "../db/schema.ts";
 
 // REST baca riwayat percakapan (R2, AD-9): GET /api/threads (daftar milik
@@ -38,11 +39,23 @@ function toThreadDto(row: Thread): ThreadDto {
   };
 }
 
-function toMessageDto(row: Message): MessageDto {
+/**
+ * Message row → DTO (AD-8 edge conversion). epic-voice: when the row carries
+ * an attached blob, it is read back owner-scoped (the thread owner IS the
+ * blob owner — the turn route only attaches blobs the session uploaded). A
+ * blob that no longer resolves omits `audio` and keeps the stored placeholder
+ * text — defensive: the GC sweep never deletes a referenced blob, but history
+ * must not break if one ever goes missing.
+ */
+function toMessageDto(db: YuiDatabase, userId: string, row: Message): MessageDto {
+  const blob = row.audioId === null ? null : getAudioById(db, userId, row.audioId);
   return {
     id: row.id,
     role: row.role as MessageRole,
     text: row.text,
+    ...(blob === null
+      ? {}
+      : { audio: { id: blob.id, mime: blob.mime, durationMs: blob.durationMs } }),
     createdAt: new Date(row.createdAt).toISOString(),
   };
 }
@@ -79,7 +92,7 @@ export function conversationRoutes(db: YuiDatabase): Hono {
     if (rows === null) {
       return errorResponse(c, 404, "not_found", "Thread not found.");
     }
-    return c.json(rows.map(toMessageDto), 200);
+    return c.json(rows.map((row) => toMessageDto(db, user.id, row)), 200);
   });
 
   return app;

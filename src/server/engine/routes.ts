@@ -12,6 +12,7 @@ import {
   createThreadWithMessage,
   resolveThread,
 } from "../conversations/turn-store.ts";
+import { resolveAudioBlob, voiceNotePlaceholder } from "../audio/store.ts";
 import { createEngineAdapter, EngineAdapterError } from "./adapter.ts";
 import { PROVIDER_KINDS, type ProviderKind, type YuiEvent } from "../../shared/engine.ts";
 
@@ -59,17 +60,79 @@ export function engineRoutes(db: YuiDatabase): Hono {
       body = null;
     }
 
+    // epic-voice (story 2): a turn carries EITHER `content` (text) XOR
+    // `audioId` (a blob this session uploaded). Shape checks stay pra-stream
+    // 400s; the blob itself is resolved owner-scoped below, BEFORE any
+    // thread/message write.
     const content = body !== null ? body.content : undefined;
-    if (typeof content !== "string" || content.trim().length === 0 || content.length > MAX_CONTENT_CHARS) {
+    const rawAudioId = body?.audioId;
+    if (rawAudioId !== undefined && (typeof rawAudioId !== "string" || rawAudioId.trim().length === 0)) {
       return c.json(
         {
           error: {
             code: "invalid_request",
-            message: `Request body must be JSON with a non-empty "content" string of at most ${MAX_CONTENT_CHARS} characters.`,
+            message: `Request body "audioId" must be a non-empty string of an uploaded audio blob, or omitted.`,
           },
         },
         400,
       );
+    }
+    const audioId = typeof rawAudioId === "string" && rawAudioId.trim().length > 0 ? rawAudioId : undefined;
+
+    // Presence of `content` under the XOR rule: a non-empty string counts, and
+    // any other defined value still counts — a malformed value must not slip
+    // past the either/or rejection below.
+    const contentProvided =
+      typeof content === "string" ? content.trim().length > 0 : content !== undefined;
+    if (audioId !== undefined && contentProvided) {
+      return c.json(
+        {
+          error: {
+            code: "invalid_request",
+            message: `Request body must provide either "content" or "audioId", not both.`,
+          },
+        },
+        400,
+      );
+    }
+
+    // The text stored as this turn's user message: the validated content for
+    // text turns, or the duration-derived placeholder for voice turns (single
+    // source of truth: voiceNotePlaceholder in the audio store). A voice turn
+    // also carries the blob id onto the inserted message row.
+    let userText: string;
+    let userAudioId: string | undefined;
+    if (audioId === undefined) {
+      if (
+        typeof content !== "string" ||
+        content.trim().length === 0 ||
+        content.length > MAX_CONTENT_CHARS
+      ) {
+        return c.json(
+          {
+            error: {
+              code: "invalid_request",
+              message: `Request body must be JSON with a non-empty "content" string of at most ${MAX_CONTENT_CHARS} characters.`,
+            },
+          },
+          400,
+        );
+      }
+      userText = content;
+    } else {
+      // Owner-scoped attach via the frozen story-1 seam. Foreign and unknown
+      // ids share one identical 404 (no existence leak), and the check runs
+      // BEFORE any thread/message write so a rejected attach leaves nothing
+      // behind. The stored durationMs derives the placeholder text.
+      const blob = resolveAudioBlob(db, user.id, audioId);
+      if (blob === null) {
+        return c.json(
+          { error: { code: "not_found", message: "Audio not found." } },
+          404,
+        );
+      }
+      userText = voiceNotePlaceholder(blob.durationMs);
+      userAudioId = blob.id;
     }
 
     // Semantik threadId (AD-5): absent → thread baru dibuat server; string →
@@ -124,7 +187,7 @@ export function engineRoutes(db: YuiDatabase): Hono {
     let newThreadTitle: string | undefined;
     let userWriteAt: number;
     if (rawThreadId === undefined) {
-      const created = createThreadWithMessage(db, user.id, content, turnStartedAt);
+      const created = createThreadWithMessage(db, user.id, userText, turnStartedAt, userAudioId);
       threadId = created.threadId;
       newThreadTitle = created.title;
       userWriteAt = created.updatedAt;
@@ -137,7 +200,7 @@ export function engineRoutes(db: YuiDatabase): Hono {
         );
       }
       threadId = thread.id;
-      userWriteAt = appendUserMessage(db, user.id, threadId, content, turnStartedAt).updatedAt;
+      userWriteAt = appendUserMessage(db, user.id, threadId, userText, turnStartedAt, userAudioId).updatedAt;
     }
 
     // (3) transkrip thread (termasuk pesan user barusan) = konten prompt

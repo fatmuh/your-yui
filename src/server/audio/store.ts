@@ -53,3 +53,18 @@ export function getAudioById(db: YuiDatabase, userId: string, audioId: string): 
 export function resolveAudioBlob(db: YuiDatabase, userId: string, audioId: string): AudioBlob | null {
   return getAudioById(db, userId, audioId);
 }
+
+/**
+ * Single source of truth for the text stored as a voice-note user message:
+ * `[Voice note: m:ss]` with zero-padded seconds (42000 → "[Voice note: 0:42]",
+ * 125000 → "[Voice note: 2:05]"). The turn route derives it from the stored
+ * blob's durationMs; history and the engine transcript then read it back as
+ * plain message text, so the format is derived in exactly one place and the
+ * client only renders durationMs from the DTO.
+ */
+export function voiceNotePlaceholder(durationMs: number): string {
+  const totalSeconds = Math.floor(durationMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `[Voice note: ${minutes}:${String(seconds).padStart(2, "0")}]`;
+}
