@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, fetchMe, loginUser, logoutUser, registerUser } from "./api.ts";
+import {
+  ApiError,
+  fetchMe,
+  fetchThreadMessages,
+  listThreads,
+  loginUser,
+  logoutUser,
+  registerUser,
+  streamTurn,
+} from "./api.ts";
+import type { YuiEvent } from "../shared/engine.ts";
 
 // Wrapper API diuji dengan fetch global di-stub (vi.stubGlobal) — tanpa server
 // dan tanpa deps test baru. Response global Node dipakai untuk membangun
@@ -28,6 +38,26 @@ function stubFetch(response: Response): ReturnType<typeof vi.fn> {
 function firstCall(mock: ReturnType<typeof vi.fn>): [string, RequestInit] {
   const [url, init] = mock.mock.calls[0] as [string, RequestInit];
   return [url, init];
+}
+
+/** Encode one SSE frame the way Hono streamSSE writes it. */
+function sseFrame(event: string, payload: Record<string, unknown>): string {
+  return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+}
+
+/** Build a 200 text/event-stream Response that emits the frames, then closes. */
+function sseResponse(frames: string[]): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const frame of frames) controller.enqueue(encoder.encode(frame));
+      controller.close();
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
 }
 
 describe("registerUser", () => {
@@ -166,5 +196,219 @@ describe("respons gagal tanpa envelope", () => {
     stubFetch(jsonResponse({ unexpected: "shape" }, 500));
 
     await expect(fetchMe()).rejects.toMatchObject({ code: "unknown" });
+  });
+});
+
+const THREAD_A = "01JCTHREADTHREADTHREADTHRE01";
+const THREAD_B = "01JCTHREADTHREADTHREADTHRE02";
+
+describe("listThreads", () => {
+  it("calls GET /api/threads and returns the ThreadDto array unchanged", async () => {
+    const threads = [
+      {
+        id: THREAD_B,
+        title: "Budget review",
+        createdAt: "2026-11-07T09:00:00.000Z",
+        updatedAt: "2026-11-07T09:05:00.000Z",
+      },
+      {
+        id: THREAD_A,
+        title: "Hello",
+        createdAt: "2026-11-06T08:00:00.000Z",
+        updatedAt: "2026-11-06T08:01:00.000Z",
+      },
+    ];
+    const mock = stubFetch(jsonResponse(threads));
+
+    await expect(listThreads()).resolves.toEqual(threads);
+    // GET without init — the session cookie rides the same-origin default.
+    expect(mock).toHaveBeenCalledWith("/api/threads");
+  });
+
+  it("401 envelope → ApiError unauthorized", async () => {
+    stubFetch(
+      jsonResponse(
+        { error: { code: "unauthorized", message: "A valid session is required." } },
+        401,
+      ),
+    );
+
+    await expect(listThreads()).rejects.toMatchObject({
+      name: "ApiError",
+      code: "unauthorized",
+      message: "A valid session is required.",
+    });
+  });
+});
+
+describe("fetchThreadMessages", () => {
+  it("calls GET /api/threads/:id/messages and returns the MessageDto array unchanged", async () => {
+    const messages = [
+      {
+        id: "01JCMESSAGEMESSAGEMESSAGEME01",
+        role: "user",
+        text: "Draft a budget",
+        createdAt: "2026-11-07T09:00:00.000Z",
+      },
+      {
+        id: "01JCMESSAGEMESSAGEMESSAGEME02",
+        role: "assistant",
+        text: "Here is a first pass.",
+        createdAt: "2026-11-07T09:00:05.000Z",
+      },
+    ];
+    const mock = stubFetch(jsonResponse(messages));
+
+    await expect(fetchThreadMessages(THREAD_A)).resolves.toEqual(messages);
+    expect(mock).toHaveBeenCalledWith(`/api/threads/${THREAD_A}/messages`);
+  });
+
+  it("404 envelope for a foreign or missing thread → ApiError not_found", async () => {
+    stubFetch(
+      jsonResponse({ error: { code: "not_found", message: "Thread not found." } }, 404),
+    );
+
+    await expect(fetchThreadMessages(THREAD_B)).rejects.toMatchObject({
+      name: "ApiError",
+      code: "not_found",
+      message: "Thread not found.",
+    });
+  });
+});
+
+describe("streamTurn", () => {
+  it("posts {content,clientToken} with no threadId key for a new thread and dispatches events in stream order", async () => {
+    const mock = stubFetch(
+      sseResponse([
+        sseFrame("thread.updated", {
+          threadId: THREAD_A,
+          title: "Hello",
+          updated_at: "2026-11-07T10:00:00.000Z",
+        }),
+        sseFrame("message.delta", {
+          threadId: THREAD_A,
+          messageId: "01JCMESSAGEMESSAGEMESSAGEME01",
+          role: "assistant",
+          text: "Hel",
+        }),
+        sseFrame("message.delta", {
+          threadId: THREAD_A,
+          messageId: "01JCMESSAGEMESSAGEMESSAGEME01",
+          role: "assistant",
+          text: "Hello",
+        }),
+        sseFrame("message.final", {
+          threadId: THREAD_A,
+          messageId: "01JCMESSAGEMESSAGEMESSAGEME01",
+          role: "assistant",
+          clientToken: "01JCTOKENTOKENTOKENTOKENTOK01",
+          text: "Hello!",
+        }),
+        sseFrame("turn.settled", { threadId: THREAD_A }),
+      ]),
+    );
+    const events: YuiEvent[] = [];
+
+    await streamTurn(
+      // threadId is passed explicitly as undefined, mirroring the production
+      // call in sendServerMessage (which always sets the key) — so the strict
+      // body assertion below proves the serializer drops the key instead of
+      // ever emitting "threadId": null (a guaranteed 400 server-side).
+      { content: "Hello", threadId: undefined, clientToken: "01JCTOKENTOKENTOKENTOKENTOK01" },
+      event => {
+        events.push(event);
+      },
+    );
+
+    expect(events.map(event => event.type)).toEqual([
+      "thread.updated",
+      "message.delta",
+      "message.delta",
+      "message.final",
+      "turn.settled",
+    ]);
+    expect(events[0]).toMatchObject({
+      type: "thread.updated",
+      threadId: THREAD_A,
+      title: "Hello",
+    });
+    expect(events[4]).toMatchObject({ type: "turn.settled", threadId: THREAD_A });
+    const [url, init] = firstCall(mock);
+    expect(url).toBe("/api/engine/turn");
+    expect(init.method).toBe("POST");
+    expect(init.headers).toMatchObject({
+      "content-type": "application/json",
+      accept: "text/event-stream",
+    });
+    expect(JSON.parse(String(init.body))).toStrictEqual({
+      content: "Hello",
+      clientToken: "01JCTOKENTOKENTOKENTOKENTOK01",
+    });
+  });
+
+  it("includes threadId in the JSON body for an existing thread", async () => {
+    const mock = stubFetch(sseResponse([sseFrame("turn.settled", { threadId: THREAD_A })]));
+
+    await streamTurn({ content: "Next turn", threadId: THREAD_A }, () => undefined);
+
+    const [, init] = firstCall(mock);
+    expect(JSON.parse(String(init.body))).toStrictEqual({
+      content: "Next turn",
+      threadId: THREAD_A,
+    });
+  });
+
+  it("rejects with the envelope ApiError on a pre-stream 4xx response", async () => {
+    stubFetch(
+      jsonResponse({ error: { code: "not_found", message: "Thread not found." } }, 404),
+    );
+
+    await expect(
+      streamTurn({ content: "Next turn", threadId: THREAD_B }, () => undefined),
+    ).rejects.toMatchObject({
+      name: "ApiError",
+      code: "not_found",
+      message: "Thread not found.",
+    });
+  });
+
+  it("stops dispatching events and rejects when the stream breaks mid-way", async () => {
+    const encoder = new TextEncoder();
+    // Pull-based stream: the first read delivers one delta, the second read
+    // errors (controller.error would discard chunks queued via start).
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          controller.enqueue(
+            encoder.encode(
+              sseFrame("message.delta", {
+                threadId: THREAD_A,
+                messageId: "01JCMESSAGEMESSAGEMESSAGEME01",
+                role: "assistant",
+                text: "Par",
+              }),
+            ),
+          );
+        } else {
+          controller.error(new Error("connection dropped"));
+        }
+      },
+    });
+    stubFetch(
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    const events: YuiEvent[] = [];
+
+    await expect(
+      streamTurn({ content: "Next turn", threadId: THREAD_A }, event => {
+        events.push(event);
+      }),
+    ).rejects.toBeInstanceOf(ApiError);
+    expect(events.map(event => event.type)).toEqual(["message.delta"]);
   });
 });

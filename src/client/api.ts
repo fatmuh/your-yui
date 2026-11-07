@@ -5,7 +5,9 @@
 // respons gagal dilempar sebagai ApiError bermuatan code+message, bukan respons
 // mentah, sehingga AuthPage menampilkan pesan bersih tanpa dump JSON.
 
-import type { UserDto } from "../shared/app.ts";
+import type { MessageDto, ThreadDto, UserDto } from "../shared/app.ts";
+import type { YuiEvent } from "../shared/engine.ts";
+import { createSseParser } from "./sse.ts";
 
 /** User sesi di wire API — turunan kontrak shared (AD-8), bukan definisi lepas. */
 export type CurrentUser = UserDto;
@@ -93,4 +95,78 @@ export async function fetchMe(): Promise<CurrentUser> {
   const response = await fetch("/api/me");
   if (!response.ok) throw await toApiError(response);
   return (await response.json()) as CurrentUser;
+}
+
+/**
+ * GET /api/threads — the session's threads, newest first (ThreadDto[]).
+ * GET without init: the session cookie rides fetch's same-origin default.
+ */
+export async function listThreads(): Promise<ThreadDto[]> {
+  const response = await fetch("/api/threads");
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as ThreadDto[];
+}
+
+/** GET /api/threads/:id/messages — one thread's history, oldest first. */
+export async function fetchThreadMessages(threadId: string): Promise<MessageDto[]> {
+  const response = await fetch(
+    `/api/threads/${encodeURIComponent(threadId)}/messages`,
+  );
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as MessageDto[];
+}
+
+/** Body for POST /api/engine/turn — omit `threadId` to start a new thread. */
+export type StreamTurnInput = {
+  content: string;
+  threadId?: string;
+  clientToken?: string;
+};
+
+/**
+ * POST /api/engine/turn and dispatch every streamed event to `onEvent` in
+ * stream order (thread.updated → message.delta* → message.final →
+ * turn.settled), typed as YuiEvent from the shared contract (AD-8). A
+ * pre-stream failure (4xx envelope) throws ApiError before any event is
+ * dispatched; a stream that breaks mid-way stops dispatching and rejects, so
+ * the caller can release the composer without a hang.
+ */
+export async function streamTurn(
+  input: StreamTurnInput,
+  onEvent: (event: YuiEvent) => void,
+): Promise<void> {
+  const response = await fetch("/api/engine/turn", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await toApiError(response);
+  if (response.body === null) {
+    throw new ApiError("unknown", "The turn response has no event stream.");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  // The server strips `type` from the payload and puts it on the frame's
+  // dispatch name (see src/server/engine/routes.ts) — restore it so the event
+  // matches the YuiEvent contract in src/shared/engine.ts.
+  const parser = createSseParser(frame => {
+    onEvent({ type: frame.event, ...frame.data } as YuiEvent);
+  });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parser.push(decoder.decode(value, { stream: true }));
+    }
+  } catch (error) {
+    // Network drop or malformed frame mid-stream: cancel the reader first so
+    // the body is not left locked and the connection hanging open (the server
+    // would stall on backpressure until unload), then surface the failure as
+    // an ApiError like every other miss. No further events are dispatched.
+    await reader.cancel().catch(() => undefined);
+    throw new ApiError(
+      "unknown",
+      error instanceof Error ? error.message : "The turn stream ended unexpectedly.",
+    );
+  }
 }

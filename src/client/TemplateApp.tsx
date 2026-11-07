@@ -15,6 +15,8 @@ import { useVoiceRecorder, voiceTime, type VoiceNote } from './useVoiceRecorder'
 import { VoiceNoteControls } from './VoiceNoteControls'
 import { VoiceCall } from './VoiceCall'
 import { useSession } from './SessionContext.tsx'
+import { ApiError, fetchThreadMessages, listThreads, streamTurn } from './api.ts'
+import type { YuiEvent } from '../shared/engine.ts'
 import './styles.css'
 
 // crypto.randomUUID hanya tersedia di secure context (https/localhost) — di
@@ -22,7 +24,13 @@ import './styles.css'
 const newId = (): string => (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : ulid())
 
 type Message = { id: string; role: 'assistant' | 'user'; text: string; files?: string[]; audio?: { url: string; duration: number }; kind?: 'choices' }
-type Conversation = { id: string; title: string; bot?: 'yui'; appearance?: BotAppearance; messages: Message[]; pinned?: boolean; unread?: boolean; hidden?: boolean; section?: string }
+// `server` marks a conversation backed by a server thread (its id IS the
+// thread id); `loaded` marks a server conversation whose history is already
+// in state (lazy-loaded once, never refetched during the session).
+type Conversation = { id: string; title: string; bot?: 'yui'; appearance?: BotAppearance; messages: Message[]; pinned?: boolean; unread?: boolean; hidden?: boolean; section?: string; server?: boolean; loaded?: boolean }
+// Per-turn stream context: the conversation the turn was sent from, plus the
+// server thread id once the first thread.updated event reveals it.
+type TurnState = { chatId: string; threadId?: string }
 type Modal = 'apps' | 'create-bot' | 'settings' | null
 
 const greeting = "Hi Fathur, I'm CFO. I'm here to help you keep your money in good shape, whether that's for a business, your personal finances, or both."
@@ -54,11 +62,17 @@ export default function App() {
     id: newId(), title: 'Yui', bot: 'yui', pinned: true,
     messages: [{ id: newId(), role: 'assistant', text: "Hi Fathur, I'm Yui. What would you like to work on today? This is a local chat demo." }],
   }])
-  const [activeId, setActiveId] = useState<string | null>(null)
+  // Pinned to the first local conversation up front: the mount fetch below
+  // prepends server threads to the array, which must never silently switch
+  // which conversation the fallback `active` resolves to.
+  const [activeId, setActiveId] = useState<string | null>(() => conversations[0].id)
   const active = conversations.find(chat => chat.id === activeId) ?? conversations[0]
   const [draft, setDraft] = useState('')
   const [files, setFiles] = useState<File[]>([])
   const [typingId, setTypingId] = useState<string | null>(null)
+  // Assistant bubble currently growing from message.delta events of a server
+  // turn — keyed by the event's messageId so cumulative text replaces in place.
+  const streamingMessageRef = useRef<{ chatId: string; messageId: string } | null>(null)
   const [callId, setCallId] = useState<string | null>(null)
   const [callMuted, setCallMuted] = useState(false)
   const callTriggerRef = useRef<HTMLButtonElement>(null)
@@ -89,6 +103,32 @@ export default function App() {
   const voiceStatus = voice.phase === 'recording' ? 'Recording voice note. Stop to send, or cancel.' : voice.phase === 'requesting' ? 'Waiting for microphone permission. Allow access in your browser, or cancel.' : voice.phase === 'stopping' ? 'Preparing voice note.' : ''
 
   useEffect(() => () => audioUrls.current.forEach(url => URL.revokeObjectURL(url)), [])
+
+  // Mount: map server threads (GET /api/threads, updatedAt desc) to server
+  // conversations ahead of the local demo ones. The pinned Yui contact keeps
+  // its local id until its first turn migrates it to the real thread id.
+  // Failures keep the local list untouched — a notice is all the user gets.
+  useEffect(() => {
+    let cancelled = false
+    listThreads()
+      .then(threads => {
+        if (cancelled || threads.length === 0) return
+        setConversations(current => {
+          const known = new Set(current.map(chat => chat.id))
+          const mapped = threads.filter(thread => !known.has(thread.id)).map<Conversation>(thread => ({
+            id: thread.id, title: thread.title, bot: 'yui', server: true, messages: [],
+          }))
+          return mapped.length === 0 ? current : [...mapped, ...current]
+        })
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        setNotice(error instanceof ApiError && error.code === 'unauthorized'
+          ? 'Session expired. Sign in again.'
+          : 'Could not load your Yui conversations. The demo chats stay available.')
+      })
+    return () => { cancelled = true }
+  }, [])
   function sendVoiceNote(note: VoiceNote, chatId: string) {
     const url = URL.createObjectURL(note.blob)
     audioUrls.current.add(url)
@@ -195,7 +235,33 @@ export default function App() {
     inputRef.current?.focus()
   }
 
+  // Lazy-load a server conversation's history exactly once; it is cached in
+  // state for the rest of the session (switching back and forth never refetches).
+  function loadHistory(chatId: string) {
+    fetchThreadMessages(chatId)
+      .then(messages => {
+        setConversations(current => current.map(chat => chat.id === chatId ? {
+          ...chat,
+          loaded: true,
+          messages: messages.map(message => ({ id: message.id, role: message.role, text: message.text })),
+        } : chat))
+      })
+      .catch((error: unknown) => {
+        if (error instanceof ApiError && error.code === 'not_found') {
+          // Thread gone server-side: keep it empty and stop retrying.
+          setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: [], loaded: true } : chat))
+          setNotice('This conversation is no longer available on the server.')
+          return
+        }
+        setNotice(error instanceof ApiError && error.code === 'unauthorized'
+          ? 'Session expired. Sign in again.'
+          : 'Could not load the conversation history. Select it again to retry.')
+      })
+  }
+
   function selectChat(id: string) {
+    const target = conversations.find(chat => chat.id === id)
+    if (target?.server && target.loaded !== true) loadHistory(id)
     setConversations(current => current.map(chat => chat.id === id ? { ...chat, unread: false, hidden: false } : chat))
     setActiveId(id)
     setDraft('')
@@ -257,6 +323,9 @@ export default function App() {
       if (active.id === target.id) {
         setActiveId(next[0].id); setDraft(''); setFiles([])
         if (typingId === target.id) setTypingId(null)
+        // The delete fallback can land on a server thread that was never
+        // selected — make sure its history still lazy-loads once.
+        if (next[0].server && next[0].loaded !== true) loadHistory(next[0].id)
       }
       setNotice('Conversation deleted.')
       sidebarRef.current?.querySelector<HTMLButtonElement>('button[aria-label="Search conversations"]')?.focus()
@@ -280,9 +349,117 @@ export default function App() {
     inputRef.current?.focus()
   }
 
+  // Apply one streamed server event to conversation state. Every update goes
+  // through functional setConversations, so events arriving after the user
+  // deleted the conversation simply find no match and are ignored silently.
+  function applyTurnEvent(turn: TurnState, event: YuiEvent): void {
+    if (event.type === 'thread.updated') {
+      if (turn.threadId === undefined) {
+        // First event of a new-thread turn: migrate the local conversation id
+        // to the server thread id (+ derived title) — the conversation becomes
+        // server-backed from here on. Its local transcript already IS the
+        // thread's full history, so it counts as loaded (no lazy fetch).
+        turn.threadId = event.threadId
+        const localId = turn.chatId
+        const threadId = event.threadId
+        setConversations(current => {
+          const index = current.findIndex(chat => chat.id === localId)
+          if (index === -1) return current
+          const migrated: Conversation = { ...current[index], id: threadId, title: event.title ?? current[index].title, server: true, loaded: true }
+          // A delayed listThreads response can already have prepended an empty
+          // server stub under the new thread id — drop it too, or the id would
+          // exist twice (duplicate keys; every event upsert would hit both rows).
+          // The migrated conversation keeps the real local transcript.
+          return [migrated, ...current.filter(chat => chat.id !== localId && chat.id !== threadId)]
+        })
+        setActiveId(current => current === localId ? threadId : current)
+        setTypingId(current => current === localId ? threadId : current)
+        return
+      }
+      // Existing thread: keep the freshest conversation at the top of the list.
+      setConversations(current => {
+        const index = current.findIndex(chat => chat.id === event.threadId)
+        if (index === -1) return current
+        return [current[index], ...current.filter((_, i) => i !== index)]
+      })
+      return
+    }
+    if (event.type === 'message.delta' || event.type === 'message.final') {
+      // Upsert the in-progress assistant bubble keyed by the event's
+      // messageId; the text is CUMULATIVE, so it replaces instead of appending.
+      streamingMessageRef.current = { chatId: event.threadId, messageId: event.messageId }
+      setConversations(current => current.map(chat => {
+        if (chat.id !== event.threadId) return chat
+        const at = chat.messages.findIndex(message => message.id === event.messageId)
+        return {
+          ...chat,
+          messages: at === -1
+            ? [...chat.messages, { id: event.messageId, role: 'assistant' as const, text: event.text }]
+            : chat.messages.map((message, index) => index === at ? { ...message, text: event.text } : message),
+        }
+      }))
+      return
+    }
+    if (event.type === 'error') {
+      // Show the failure in-thread: replace the in-progress bubble (if any)
+      // with the error text, or append one when nothing had streamed yet.
+      const text = `[error] ${event.message}`
+      const inProgress = streamingMessageRef.current
+      streamingMessageRef.current = null
+      setConversations(current => current.map(chat => {
+        if (chat.id !== event.threadId) return chat
+        if (inProgress !== null && inProgress.chatId === event.threadId) {
+          return { ...chat, messages: chat.messages.map(message => message.id === inProgress.messageId ? { ...message, text } : message) }
+        }
+        return { ...chat, messages: [...chat.messages, { id: newId(), role: 'assistant' as const, text }] }
+      }))
+      return
+    }
+    // turn.settled is always the last event: release the composer — but only
+    // when typingId still points at THIS turn's conversation, so a stale turn
+    // cannot unblock the composer while a newer one is still streaming.
+    streamingMessageRef.current = null
+    setTypingId(current => current === (turn.threadId ?? turn.chatId) ? null : current)
+  }
+
+  // Server turn for the Yui contact: optimistic user bubble → POST
+  // /api/engine/turn → streamed events grow the assistant bubble in place.
+  function sendServerMessage(text: string) {
+    if (!text) {
+      // The server demands non-empty content; attachments alone stay local.
+      setNotice('Type a message to send')
+      return
+    }
+    const chatId = active.id
+    const turn: TurnState = { chatId, threadId: active.server === true ? chatId : undefined }
+    const message: Message = { id: newId(), role: 'user', text, files: files.map(file => file.name) }
+    setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: [...chat.messages, message] } : chat))
+    setDraft('')
+    setFiles([])
+    setTypingId(chatId)
+    void streamTurn({ content: text, threadId: turn.threadId, clientToken: newId() }, event => applyTurnEvent(turn, event))
+      .catch((error: unknown) => {
+        // Pre-stream rejection or mid-stream failure: release the composer and
+        // surface a notice — turn-scoped, so a stale turn's rejection cannot
+        // release a newer turn still streaming. The optimistic user bubble
+        // stays (v1 has no auto-retry); an in-progress bubble keeps its last text.
+        streamingMessageRef.current = null
+        setTypingId(current => current === (turn.threadId ?? turn.chatId) ? null : current)
+        if (error instanceof ApiError && error.code === 'unauthorized') setNotice('Session expired. Sign in again.')
+        else if (error instanceof ApiError) setNotice(error.message)
+        else setNotice('Could not reach Yui. Check your connection and try again.')
+      })
+  }
+
   function sendMessage(answer?: string) {
     const text = answer ?? draft.trim()
     if ((!text && files.length === 0) || typingId || voiceActive) return
+    // Only the Yui contact talks to the server; every other conversation
+    // keeps the template's local mock reply below, untouched.
+    if (active.server || active.bot === 'yui') {
+      sendServerMessage(text)
+      return
+    }
     const chatId = active.id
     const message: Message = { id: newId(), role: 'user', text, files: files.map(file => file.name) }
     setConversations(current => current.map(chat => chat.id === chatId ? { ...chat, messages: [...chat.messages, message] } : chat))
