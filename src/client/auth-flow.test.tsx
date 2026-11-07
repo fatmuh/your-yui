@@ -1,14 +1,27 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import type { ReactElement } from "react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import App, { SessionGate } from "./App.tsx";
 import AuthPage from "./AuthPage.tsx";
-import HomePage from "./HomePage.tsx";
 import { SessionContext, type SessionState } from "./SessionContext.tsx";
 
 // Uji komponen gerbang sesi tanpa deps test baru: renderToStaticMarkup + stub
 // nilai SessionContext (efek tidak pernah berjalan di static markup, jadi
 // state loading adalah render awal App, dan state lain disuntik lewat provider).
+
+// Aplikasi template membaca matchMedia saat render (lebar viewport menentukan
+// layout sidebar/panel) — Node tidak memilikinya, jadi stub untuk render statis.
+function stubMatchMedia(): void {
+  vi.stubGlobal("matchMedia", () => ({
+    matches: false,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  }));
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 const STUB_USER = {
   id: "01JCTESTTESTTESTTESTTESTTE",
@@ -36,7 +49,7 @@ describe("gerbang sesi (SessionGate)", () => {
     expect(html).toContain("Yui");
     expect(html).toContain("Loading…");
     expect(html).not.toContain("Sign in to Yui");
-    expect(html).not.toContain("Signed in as");
+    expect(html).not.toContain("Connect apps");
   });
 
   it("tanpa sesi: status unauthenticated → AuthPage (bukan loading/home)", () => {
@@ -44,16 +57,18 @@ describe("gerbang sesi (SessionGate)", () => {
 
     expect(html).toContain("Sign in to Yui");
     expect(html).not.toContain("Loading…");
-    expect(html).not.toContain("Signed in as");
+    expect(html).not.toContain("Connect apps");
   });
 
-  it("sesi valid: status authenticated → HomePage", () => {
+  it("sesi valid: status authenticated → aplikasi template (bukan auth/loading)", () => {
+    stubMatchMedia();
     const html = renderWithSession(
       { status: "authenticated", user: STUB_USER },
       <SessionGate />,
     );
 
-    expect(html).toContain("Signed in as");
+    expect(html).toContain("Connect apps");
+    expect(html).toContain("CFO");
     expect(html).not.toContain("Sign in to Yui");
     expect(html).not.toContain("Loading…");
   });
@@ -88,28 +103,5 @@ describe("AuthPage", () => {
 
     expect(html).toContain("Username is already taken.");
     expect(html).not.toContain('{"error"');
-  });
-});
-
-describe("HomePage", () => {
-  it("user stub: menampilkan username, info createdAt ISO, dan tombol Sign out", () => {
-    const html = renderWithSession({ status: "authenticated", user: STUB_USER }, <HomePage />);
-
-    expect(html).toContain("Signed in as");
-    expect(html).toContain("arjuna");
-    expect(html).toContain("Sign out");
-    expect(html).toContain("2026-11-06T10:00:00.000Z");
-  });
-
-  it("tanpa createdAt (hasil register/login langsung): tetap utuh tanpa info sesi", () => {
-    const html = renderWithSession(
-      { status: "authenticated", user: { id: STUB_USER.id, username: STUB_USER.username } },
-      <HomePage />,
-    );
-
-    expect(html).toContain("Signed in as");
-    expect(html).toContain("arjuna");
-    expect(html).toContain("Sign out");
-    expect(html).not.toContain("Account created");
   });
 });

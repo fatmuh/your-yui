@@ -1,0 +1,55 @@
+.avatar--custom { background: transparent; border-radius: 0; }
+.avatar--custom > svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.avatar--custom.header-avatar { transform: none; }
+.create-bot-dialog { position: fixed; margin: auto; width: min(496px, calc(100% - 32px)); max-width: none; max-height: calc(100dvh - 32px); padding: 0; overflow: hidden; border: 1px solid #363636; border-radius: 17px; background: #202020; color: #ededed; }
+.create-bot-dialog::backdrop { background: #000b; }
+.create-bot-dialog > form { display: flex; flex-direction: column; max-height: calc(100dvh - 34px); }
+.create-bot-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; min-height: 61px; padding: 14px 18px; border-bottom: 1px solid #333; }
+.create-bot-header h2 { margin: 0; font-size: 1rem; line-height: 1.5; font-weight: 700; }
+.create-bot-header button { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: 7px; background: transparent; color: #a2a2a2; }
+.create-bot-body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 20px 18px 27px; }
+.create-bot-body > .create-bot-preview { display: flex; width: 118px; height: 118px; margin: 0 auto 24px; }
+#bot-name { display: block; width: 100%; min-width: 0; min-height: 40px; border: 1px solid #383838; border-radius: 9px; padding: 7px 12px; background: transparent; color: #ededed; text-align: center; font-size: .9375rem; line-height: 1.5; }
+#bot-name::placeholder { color: #a2a2a2; }
+#bot-name:focus-visible { outline: none; border-color: #666; }
+.bot-shape-picker, .bot-color-picker { min-width: 0; padding: 0; border: 0; margin: 26px 0 0; }
+.bot-shape-options { display: flex; flex-wrap: wrap; justify-content: center; gap: 14px 20px; max-width: 316px; margin: auto; }
+.bot-shape-option, .bot-color-option { display: inline-flex; position: relative; flex-shrink: 0; cursor: pointer; border-radius: 50%; }
+.bot-shape-option { width: 46px; height: 46px; }
+.bot-shape-option input, .bot-color-option input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; opacity: 0; margin: 0; cursor: pointer; }
+.bot-shape-face { display: grid; place-items: center; width: 100%; height: 100%; border: 1px solid transparent; border-radius: 50%; }
+.bot-shape-face .avatar { width: 44px; height: 44px; }
+.bot-shape-option input:checked + .bot-shape-face { border-color: #707070; background: #2c2c2c; }
+.bot-shape-option input:focus-visible + .bot-shape-face, .bot-color-option input:focus-visible + .bot-color-swatch { outline: 2px solid var(--focus-ring); outline-offset: 4px; }
+.bot-color-picker { margin-top: 30px; }
+.bot-color-options { display: flex; flex-wrap: wrap; justify-content: center; gap: 14px; max-width: 266px; margin: auto; padding: 4px; }
+.bot-color-option { width: 30px; height: 30px; }
+.bot-color-swatch { display: grid; place-items: center; width: 100%; height: 100%; border-radius: 50%; color: #202020; }
+.bot-color-option input:checked + .bot-color-swatch { box-shadow: 0 0 0 3px #202020, 0 0 0 4px #777; }
+.create-bot-footer { display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0; padding: 13px 14px; border-top: 1px solid #333; }
+.create-bot-footer button { min-height: 36px; padding: 6px 14px; border-radius: 999px; font-size: .9375rem; line-height: 1.5; }
+.bot-cancel { background: #262626; border: 1px solid #424242; }
+.bot-create { background: var(--control-primary-bg); color: var(--control-primary-text); border: 1px solid transparent; font-weight: 600; }
+.bot-create:disabled { background: #383838; color: #9b9b9b; cursor: not-allowed; }
+@media (hover: hover) and (pointer: fine) {
+  .create-bot-header button:hover { background: #303030; color: #fff; }
+  .bot-shape-option:hover .bot-shape-face { background: #303030; }
+  .bot-cancel:hover { background: #333; }
+  .bot-create:not(:disabled):hover { background: var(--control-primary-hover); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .bot-shape-face, .create-bot-footer button, .create-bot-header button { transition: background-color 120ms ease, scale 150ms ease; }
+  .bot-shape-option:active .bot-shape-face, .create-bot-footer button:not(:disabled):active { scale: .96; }
+}
+@media (max-width: 420px) {
+  .create-bot-dialog { width: calc(100% - 24px); }
+  .create-bot-header { padding-inline: 14px; }
+  .create-bot-body { padding-inline: 14px; }
+  .bot-shape-options { column-gap: 7px; }
+  .bot-color-options { gap: 12px; }
+}
+@media (forced-colors: active) {
+  .bot-shape-option input:checked + .bot-shape-face, .bot-color-option input:checked + .bot-color-swatch { outline: 2px solid Highlight; outline-offset: 2px; }
+  .bot-color-swatch { forced-color-adjust: none; }
+  #bot-name:focus-visible { outline: 2px solid Highlight; }
+}

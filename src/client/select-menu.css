@@ -1,0 +1,143 @@
+.select-trigger {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  border: 1px solid transparent;
+  color: #ededed;
+  text-align: start;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.select-value { min-width: 0; overflow-wrap: anywhere; }
+.select-chevron { flex-shrink: 0; color: #a3a3a3; }
+.select-trigger--settings {
+  gap: 6px;
+  min-height: 28px;
+  margin-inline-start: auto;
+  padding-block: 2px;
+  padding-inline: 10px 8px;
+  border-color: #3a3a3a;
+  border-radius: 999px;
+  background: #2a2a2a;
+  font-size: 0.8125rem;
+}
+.select-trigger--call {
+  gap: 6px;
+  max-width: 58%;
+  min-height: 28px;
+  margin-inline-start: auto;
+  padding-block: 2px;
+  padding-inline: 8px 6px;
+  border-radius: 8px;
+  background: #2a2a2a;
+  font-size: 0.8125rem;
+}
+.select-trigger--call .select-chevron { color: #d4d4d4; }
+.select-trigger--panel {
+  gap: 4px;
+  min-height: 24px;
+  margin-inline-start: auto;
+  padding: 1px 6px;
+  border-color: #484848;
+  border-radius: 8px;
+  background: #202020;
+  font-size: 0.8125rem;
+}
+
+/* UA popover stylesheet centers with inset:0 and margin:auto. */
+.select-popup {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  box-sizing: border-box;
+  width: max-content;
+  height: auto;
+  max-width: min(280px, calc(100dvw - 16px));
+  max-height: min(280px, calc(100dvh - 16px));
+  padding: 4px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid #333;
+  border-radius: 10px;
+  background: #1c1c1c;
+  color: #ededed;
+  box-shadow: 0 16px 40px #000a;
+}
+.select-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  width: max-content;
+  min-width: 100%;
+  min-height: 28px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  text-align: start;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.select-option:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+  background: #2c2c2c;
+}
+.select-option[aria-selected='true'] { background: #262626; }
+.select-check {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-inline-start: auto;
+  color: #ededed;
+}
+.select-option-label { white-space: nowrap; }
+
+/* Keep the popup in the top layer during its exit. The directed animation starts
+   synchronously in beforetoggle so there is no fully-visible frame before entry. */
+@media (prefers-reduced-motion: no-preference) {
+  .select-popup.t-toast,
+  .select-popup.t-toast.is-open,
+  .select-popup.t-toast.is-open:not(:popover-open),
+  .select-popup.t-toast:popover-open {
+    transition-property: display, overlay;
+    transition-duration: var(--toast-close);
+    transition-timing-function: var(--toast-ease);
+    transition-behavior: allow-discrete;
+  }
+  .select-popup.t-toast,
+  .select-popup.t-toast.is-open:not(:popover-open) {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .select-popup.t-toast:popover-open {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+    pointer-events: auto;
+    transition-duration: var(--toast-open);
+  }
+}
+
+@media (hover: hover) {
+  .select-trigger--settings:hover,
+  .select-trigger--call:hover { background: #333; }
+  .select-trigger--panel:hover { background: #2a2a2a; }
+  .select-option:hover { background: #2a2a2a; }
+}
+/* Buttons do not trigger iOS input zoom. Call text stays 16px on touch anyway. */
+@media (pointer: coarse) {
+  .select-trigger--call { font-size: 1rem; }
+}
+@media (max-width: 420px) {
+  .select-trigger--call { max-width: 100%; }
+}
+@media (forced-colors: active) {
+  .select-popup,
+  .select-trigger { border: 1px solid ButtonText; }
+  .select-option:focus-visible { outline: 2px solid Highlight; }
+}

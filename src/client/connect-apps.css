@@ -1,0 +1,64 @@
+.connect-apps-dialog { position: fixed; margin: auto; width: min(960px, calc(100% - 48px)); height: min(760px, calc(100dvh - 64px)); max-width: none; max-height: none; overflow: hidden; padding: 0; border: 1px solid #363636; border-radius: 18px; background: #202020; color: #ededed; box-shadow: 0 24px 90px #0006; font-size: .875rem; }
+.connect-apps-dialog::backdrop { background: #000b; }
+.catalog-close { position: absolute; z-index: 1; inset-block-start: 12px; inset-inline-end: 12px; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; color: #a2a2a2; }
+.catalog-scroll { height: 100%; overflow-y: auto; overscroll-behavior: contain; padding: 52px 32px 32px; scroll-padding-block: 16px; }
+.catalog-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-block-end: 20px; }
+.catalog-header h2 { font-size: 1.25rem; line-height: 1.3; font-weight: 600; }
+.catalog-connected { display: inline-flex; align-items: center; gap: 8px; min-height: 30px; color: #a2a2a2; border-radius: 8px; }
+.catalog-connected-marks { display: flex; }
+.catalog-connected-marks .catalog-mark { width: 20px; height: 20px; margin-inline-end: -4px; border-radius: 5px; font-size: .625rem; }
+.catalog-connected-marks .catalog-mark svg { width: 14px; height: 14px; }
+.catalog-tools { display: flex; gap: 8px; }
+.catalog-search { display: flex; align-items: center; flex: 1; min-width: 0; gap: 8px; min-height: 36px; padding: 6px 12px; border: 1px solid #383838; border-radius: 999px; color: #a2a2a2; }
+.catalog-search:focus-within { border-color: #666; }
+.catalog-search input { width: 100%; min-width: 0; font-size: 1rem; line-height: 1.5; background: transparent; color: #ededed; }
+.catalog-search input:focus-visible { outline: none; }
+.catalog-search input::placeholder { color: #a2a2a2; }
+.catalog-search > svg { flex-shrink: 0; }
+.catalog-templates { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; gap: 8px; min-height: 36px; padding: 6px 12px; border: 1px solid #383838; border-radius: 999px; }
+.catalog-templates > svg { color: #a2a2a2; }
+.catalog-bot-mark { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; background: #fff; color: #202020; font-size: .625rem; }
+.catalog-filters, .catalog-more { display: flex; flex-wrap: wrap; gap: 8px; margin-block-start: 12px; }
+.catalog-filters button, .catalog-more button { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 5px 11px; border-radius: 999px; background: #292929; line-height: 1.4; }
+.catalog-filters button[aria-pressed='true'], .catalog-more button[aria-pressed='true'] { background: #ededed; color: #202020; }
+.catalog-demo { margin-block-start: 12px; color: #a2a2a2; font-size: .75rem; line-height: 1.5; }
+.catalog-section { margin-block-start: 28px; }
+.catalog-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-block-end: 14px; }
+.catalog-section h3 { font-size: 1rem; line-height: 1.5; font-weight: 600; overflow-wrap: anywhere; }
+.catalog-section-heading button { flex-shrink: 0; min-height: 24px; color: #a2a2a2; font-size: .8125rem; border-radius: 4px; }
+.catalog-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 32px; row-gap: 8px; }
+.catalog-app { display: flex; align-items: center; gap: 12px; min-width: 0; min-height: 60px; padding-block: 8px; }
+.catalog-mark { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; flex-shrink: 0; border: 1px solid #333; border-radius: 12px; background: #181b20; color: #fff; font-size: 1.5rem; font-weight: 650; line-height: 1; }
+.catalog-mark > svg { width: 28px; height: 28px; }
+.catalog-mark--vercel, .catalog-mark--gmail, .catalog-mark--calendar, .catalog-mark--slack, .catalog-mark--drive { background: #fff; color: #080808; border-color: #ddd; }
+.catalog-mark--supabase { background: #202020; color: #35cf91; }
+.catalog-mark--N { background: #fff; color: #111; font-family: Georgia, serif; }
+.catalog-mark--figma { color: #f49b71; }
+.catalog-calendar { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 6px; background: #3179d8; color: #fff; font-size: 1rem; font-weight: 500; }
+.catalog-app-name { flex: 1; min-width: 0; font-weight: 550; overflow-wrap: anywhere; }
+.catalog-connect { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; gap: 4px; min-width: 90px; min-height: 28px; padding: 4px 12px; border-radius: 999px; background: #2a2a2a; font-size: .8125rem; line-height: 1.5; }
+.catalog-connect[aria-pressed='true'] { background: #383838; }
+.catalog-empty, .catalog-template-page { margin-block: 40px; text-align: center; }
+.catalog-empty h3, .catalog-template-page h3 { font-size: 1rem; font-weight: 600; }
+.catalog-empty p, .catalog-template-page p { margin: 8px auto 16px; max-width: 48ch; color: #a2a2a2; line-height: 1.6; }
+.catalog-template-page > svg { margin: 0 auto 12px; color: #a2a2a2; }
+.catalog-empty button, .catalog-template-page button { min-height: 32px; padding: 6px 12px; border-radius: 8px; background: #363636; }
+@media (hover: hover) {
+  .catalog-close:hover, .catalog-connect:hover, .catalog-templates:hover, .catalog-filters button:not([aria-pressed='true']):hover { background: #383838; }
+  .catalog-connected:hover, .catalog-section-heading button:hover { color: #ededed; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .catalog-connect, .catalog-filters button { transition: background-color 120ms ease-out; }
+}
+@media (max-width: 700px) {
+  .connect-apps-dialog { width: calc(100% - 24px); height: calc(100dvh - 32px); }
+  .catalog-scroll { padding: 48px 16px 24px; }
+  .catalog-grid { grid-template-columns: minmax(0, 1fr); }
+  .catalog-tools { flex-wrap: wrap; }
+  .catalog-search { flex-basis: 100%; }
+  .catalog-templates { min-height: 32px; }
+}
+@media (forced-colors: active) {
+  .catalog-search:focus-within { outline: 2px solid Highlight; }
+  .catalog-filters button[aria-pressed='true'], .catalog-connect[aria-pressed='true'] { outline: 2px solid Highlight; outline-offset: -2px; }
+}

@@ -1,0 +1,139 @@
+/* Call pill slides down from the top, then back up. It is never a phone notch.
+   Inset and opacity are transitions so a close mid-open reverses. */
+:root {
+  --call-open-dur: 480ms;
+  --call-close-dur: 320ms;
+  --call-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --call-pill-height: 64px;
+  --call-rest: 88px;
+  --call-accent: #11c478;
+}
+
+.voice-call {
+  position: absolute;
+  z-index: 20;
+  inset-block-start: 8px;
+  inset-inline-start: 50%;
+  translate: -50% 0;
+  width: min(440px, calc(100% - 28px));
+  height: auto;
+  min-height: var(--call-pill-height);
+  overflow: hidden;
+  overscroll-behavior: contain;
+  border: 1px solid #2a2a2a;
+  border-radius: 999px;
+  background: #1c1c1c;
+  color: #ededed;
+  box-shadow: 0 18px 48px #000c;
+  opacity: 0;
+  pointer-events: none;
+  /* Radius is not interpolated. 999px → 28px while the accordion grows
+     clamps against the changing height and reads as a bounce. */
+  transition-property: inset-block-start, opacity, border-color, background-color, box-shadow;
+  transition-duration: var(--call-open-dur);
+  transition-timing-function: var(--call-ease);
+}
+.voice-call[data-phase="open"] {
+  inset-block-start: var(--call-rest);
+  opacity: 1;
+  transition-property: inset-block-start, opacity, border-color, background-color, box-shadow, border-radius;
+  transition-duration: var(--call-open-dur), var(--call-open-dur), var(--call-open-dur), var(--call-open-dur), var(--call-open-dur), 0s;
+  transition-delay: 0s, 0s, 0s, 0s, 0s, var(--acc-collapse);
+}
+.voice-call[data-phase="open"][data-open] {
+  border-radius: 28px;
+  transition-delay: 0s;
+}
+.voice-call[data-settled] {
+  overflow: auto;
+  max-height: calc(100dvh - var(--call-rest) - 28px);
+  pointer-events: auto;
+}
+.voice-call[data-phase="closing"] {
+  pointer-events: none;
+  overflow: hidden;
+}
+[dir='rtl'] .voice-call { translate: 50% 0; }
+.call-toolbar { display: flex; align-items: center; gap: 10px; min-height: 64px; padding: 8px 10px 8px 12px; }
+.call-avatar { display: flex; flex-shrink: 0; }
+.call-avatar .avatar { width: 38px; height: 38px; }
+.call-meter { display: flex; flex: 1; align-items: center; justify-content: center; gap: 4px; min-width: 36px; height: 16px; color: var(--call-accent); }
+.call-meter i { display: block; width: 3px; flex-shrink: 0; min-height: 3px; border-radius: 99px; background: currentColor; }
+.call-buttons { display: flex; align-items: center; gap: 8px; margin-inline-start: auto; }
+.call-buttons button { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 42px; height: 42px; border: 1px solid transparent; border-radius: 50%; background: #2a2a2a; color: #c8c8c8; }
+.call-buttons button[aria-expanded='true'], .call-buttons button[aria-pressed='true'] { background: #3d3d3d; color: #fff; }
+.call-buttons .call-end { background: #d1253a; color: #fff; }
+.call-buttons button:disabled { opacity: .4; cursor: not-allowed; }
+.call-settings, .call-transcript, .call-error { border-block-start: 1px solid #333; padding: 6px 18px 14px; }
+.call-setting { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; font-size: .9375rem; line-height: 1.4; }
+.call-settings p, .call-transcript p, .call-error p { color: #a3a3a3; font-size: .75rem; line-height: 1.5; overflow-wrap: anywhere; }
+.call-settings p { margin-block-start: 4px; }
+.call-transcript h2 { margin-block-end: 6px; font-size: .9375rem; font-weight: 600; }
+.call-error button { margin-block-start: 8px; min-height: 32px; padding: 4px 12px; border-radius: 99px; background: #3d3d3d; font-size: .8125rem; }
+.voice-live-mic { background: var(--call-accent, #11c478); color: #111; border-color: transparent; }
+.voice-live-mic svg { width: 20px; height: 20px; }
+.voice-live-mic[aria-pressed='true'] { background: #2a2a2a; color: #ededed; border-color: #3a3a3a; }
+@media (hover: hover) {
+  .call-buttons button:not(:disabled):hover { background: #3a3a3a; color: #fff; }
+  .call-buttons .call-end:hover { background: #e02d44; }
+  .voice-live-mic:not([aria-pressed='true']):hover { background: color-mix(in srgb, var(--call-accent, #11c478) 86%, #000); color: #111; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .voice-call[data-phase="closing"] {
+    inset-block-start: 8px;
+    opacity: 0;
+    transition-property: inset-block-start, opacity, border-color, background-color, box-shadow;
+    transition-duration: var(--call-close-dur), 90ms, var(--call-close-dur), var(--call-close-dur), var(--call-close-dur);
+    transition-delay: 0s, calc(var(--call-close-dur) - 70ms), 0s, 0s, 0s;
+    transition-timing-function: var(--call-ease);
+  }
+  .call-buttons button, .voice-live-mic { transition: background-color 120ms cubic-bezier(.2, 0, 0, 1), color 120ms cubic-bezier(.2, 0, 0, 1), scale 150ms ease-out; }
+  .call-buttons button:not(:disabled):active, .voice-live-mic:active { scale: .96; }
+  .call-face {
+    opacity: 0;
+    filter: blur(2px);
+    transition: opacity 140ms var(--call-ease), filter 140ms var(--call-ease);
+  }
+  .voice-call[data-phase="open"] .call-face {
+    opacity: 1;
+    filter: blur(0);
+    transition-duration: 260ms;
+    transition-delay: 140ms;
+  }
+  .voice-call[data-phase="closing"] .call-face {
+    opacity: 0;
+    filter: blur(2px);
+    transition-duration: 120ms;
+    transition-delay: 0s;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-call {
+    inset-block-start: var(--call-rest);
+    opacity: 0;
+    overflow: auto;
+    max-height: calc(100dvh - var(--call-rest) - 28px);
+    transition: opacity 150ms ease-out;
+  }
+  .voice-call[data-phase="open"] { opacity: 1; }
+  .voice-call[data-phase="open"][data-open] { border-radius: 28px; }
+  .voice-call[data-phase="closing"] { opacity: 0; pointer-events: none; }
+  .voice-call[data-settled] { pointer-events: auto; }
+  .call-face { opacity: 1; filter: none; transition: none; }
+}
+@media (max-width: 767px) {
+  :root { --call-rest: 84px; }
+}
+@media (max-height: 480px) {
+  :root { --call-rest: 70px; }
+}
+@media (max-width: 420px) {
+  .call-toolbar { gap: 6px; padding: 8px; }
+  .call-meter { gap: 2px; }
+  .call-meter i:nth-child(n+8) { display: none; }
+  .call-buttons { gap: 4px; }
+  .call-buttons button { width: 36px; height: 36px; }
+  .call-avatar .avatar { width: 30px; height: 30px; }
+  .call-settings, .call-transcript, .call-error { padding-inline: 12px; }
+  .call-setting { flex-wrap: wrap; }
+}

@@ -1,10 +1,12 @@
 import devServer, { defaultOptions } from "@hono/vite-dev-server";
+import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 export default defineConfig({
   plugins: [
     react(),
+    tailwindcss(),
     devServer({
       // dev.ts membuka + memigrasi DB dev lalu men-export app — sehingga
       // /api/* hidup di `npm run dev`; produksi tetap lewat src/server/index.ts.
